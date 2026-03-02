@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pandas
+numpy
+xgboost
+scikit-learn
+scipy
+boto3
+pyarrow
+nfl-data-py
+pydantic
