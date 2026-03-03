@@ -1,0 +1,220 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "NFL Predictor — ECR, ECS Fargate, IAM task roles, S3, CloudWatch"
+
+Parameters:
+  AppName:
+    Type: String
+    Default: nfl-predictor
+  ContainerPort:
+    Type: Number
+    Default: 8000
+  Cpu:
+    Type: String
+    Default: "512"
+  Memory:
+    Type: String
+    Default: "1024"
+  DesiredCount:
+    Type: Number
+    Default: 1
+
+Resources:
+
+  # -----------------------------------------------------------------------
+  # ECR Repository
+  # -----------------------------------------------------------------------
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref AppName
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # -----------------------------------------------------------------------
+  # CloudWatch Log Group
+  # -----------------------------------------------------------------------
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AppName}"
+      RetentionInDays: 30
+
+  # -----------------------------------------------------------------------
+  # ECS Cluster
+  # -----------------------------------------------------------------------
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AppName}-cluster"
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  # -----------------------------------------------------------------------
+  # Task Execution Role (ECR pull + CloudWatch logs)
+  # -----------------------------------------------------------------------
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-task-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # -----------------------------------------------------------------------
+  # Task Role (S3 access for model/data)
+  # -----------------------------------------------------------------------
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-task-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3ModelAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - arn:aws:s3:::nfl-predictor-bucket
+                  - arn:aws:s3:::nfl-predictor-bucket/*
+
+  # -----------------------------------------------------------------------
+  # Security Group
+  # -----------------------------------------------------------------------
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${AppName} ECS service"
+      VpcId: vpc-00e3bf3a7de02236f
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+
+  # -----------------------------------------------------------------------
+  # Task Definition
+  # -----------------------------------------------------------------------
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AppName}-task-init"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref Cpu
+      Memory: !Ref Memory
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AppName}:latest"
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: ecs
+          Environment:
+            - Name: S3_BUCKET
+              Value: nfl-predictor-bucket
+            - Name: NFL_SEASON
+              Value: "2024"
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - !Sub "curl -f http://localhost:${ContainerPort}/health || exit 1"
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+
+  # -----------------------------------------------------------------------
+  # ECS Service
+  # -----------------------------------------------------------------------
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${AppName}-service"
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref ServiceSecurityGroup
+          Subnets:
+            - subnet-0688752e07d0d7f9d
+            - subnet-0c2215ca7faf94c39
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+
+  # -----------------------------------------------------------------------
+  # S3 Bucket for models and cached data
+  # -----------------------------------------------------------------------
+  ModelBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: nfl-predictor-bucket
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldDataCache
+            Prefix: data/
+            Status: Enabled
+            ExpirationInDays: 90
+
+Outputs:
+  ECRRepositoryUri:
+    Value: !GetAtt ECRRepository.RepositoryUri
+    Description: ECR repository URI for docker push
+  ClusterName:
+    Value: !Ref ECSCluster
+  ServiceName:
+    Value: !GetAtt ECSService.Name
+  S3BucketName:
+    Value: !Ref ModelBucket
