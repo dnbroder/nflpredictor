@@ -1,22 +1,17 @@
 """
-NFL Feature Engineering -- Four-Layer Cyclical Architecture
+NFL Feature Engineering — Four-Layer Cyclical cycle baseline Architecture
+Mirrors GolfPredictor feature_engineering.py exactly in structure.
 
-Layer 1: P2S  -- Possession-to-Score cycle baseline (implemented)
-Layer 2: P2SZ -- Possession-to-Scoring Zone cycle baseline (implemented)
-Layer 3: PIC  -- Player Impact Curve (Phase 3 stub)
-Layer 4: PIM  -- Personal Impact Measurement (Phase 4 stub)
+Layer 1: P2S  — Possession-to-Score cycle baseline (L1 implemented)
+Layer 2: P2SZ — Possession-to-Scoring Zone cycle baseline (L2 implemented)
+Layer 3: PIC  — Player Impact Curve (Phase 3)
+Layer 4: PIM  — Personal Impact Measurement (Phase 4)
 
-Unit of analysis: game-team row (each game produces two rows).
-
-FIXES vs original:
-  - Added TARGET_COLUMNS dict (was missing -- caused ImportError in model.py/backtester.py)
-  - Column refs now match nfl_data.py output exactly
-  - Added 'target' param to engineer_features()
-  - _build_target replaced with _build_targets (builds all target columns)
-  - _validate_and_clean now takes target param
+Unit of analysis: game-team row (each game produces two rows — one per team).
+This mirrors GolfPredictor's per-player-round row structure.
 """
 
-import logging
+from nfl_predictor.logger import get_logger
 import time
 import warnings
 from typing import List, Optional
@@ -24,101 +19,175 @@ from typing import List, Optional
 import numpy as np
 import pandas as pd
 
-logger = logging.getLogger("nflpredictor")
+logger = get_logger(__name__)
+
 warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
 
 # ---------------------------------------------------------------------------
-# Targets -- dict mapping market name -> column name in featured DataFrame
+# Target
 # ---------------------------------------------------------------------------
-TARGET_COLUMNS = {
-    "over_total":       "over_total",
-    "spread":           "beat_spread",
-    "moneyline":        "win_game",
-    "team_total_over":  "team_over",
-}
-
-TARGET_COLUMN = "over_total"
+TARGET_COLUMN = "over_total"  # game goes over the total line
 
 # ---------------------------------------------------------------------------
 # Feature registry
 # ---------------------------------------------------------------------------
 FEATURE_COLUMNS = [
-    # L1: P2S
-    "p2s_baseline", "p2s_ratio", "p2s_miss_streak", "p2s_optimal_zone",
-    "p2s_conversion_rate_5g", "p2s_conversion_rate_20g",
-    "p2s_cycle_position", "p2s_hot_streak_prob", "p2s_cold_streak_prob",
-    # L1 Defense
-    "p2s_def_baseline", "p2s_def_ratio", "p2s_def_optimal_zone",
-    # L2: P2SZ Red zone
-    "p2sz_rz_baseline", "p2sz_rz_ratio", "p2sz_rz_optimal_zone", "p2sz_rz_rate_5g",
-    # L2: P2SZ Scoring position
-    "p2sz_sp_baseline", "p2sz_sp_ratio", "p2sz_sp_optimal_zone", "p2sz_sp_rate_5g",
-    # L2: Drive quality
-    "p2sz_yards_per_drive", "p2sz_explosive_rate",
-    "p2sz_3rd_conv_baseline", "p2sz_3rd_conv_optimal_zone", "p2sz_avg_start_yard_line",
-    # L1 x L2 Intersection
-    "p2s_p2sz_dual_optimal", "p2s_p2sz_signal_strength", "matchup_dual_optimal",
-    # L3: PIC stubs
-    "pic_composite_l1", "pic_composite_l2", "pic_lineup_delta_l1", "pic_lineup_delta_l2",
-    "pic_key_player_active", "pic_ol_composite", "pic_pass_rush_opp",
-    # L4: PIM stubs
-    "pim_trajectory", "pim_salary_signal", "pim_volatility",
-    # Contextual
-    "is_home", "rest_days", "rest_advantage", "is_dome", "temp", "wind_mph",
-    "is_cold_game", "is_windy_game", "is_div_game", "season_week", "is_playoffs",
-    "opening_total", "closing_total", "total_movement",
-    "opening_spread", "closing_spread", "spread_movement",
-    "implied_team_score", "vegas_win_prob",
-    "epa_offense_avg", "epa_defense_avg",
-    "scoring_avg_5g", "scoring_avg_20g", "scoring_allowed_avg_5g",
+
+    # ── Layer 1: P2S — Possession-to-Score cycle baseline ─────────────────────────
+    # Offense
+    "p2s_baseline",                     # avg drives between scoring drives (baseline)
+    "p2s_ratio",               # current non-scoring streak / p2s_baseline
+    "p2s_miss_streak",              # consecutive non-scoring drives
+    "p2s_optimal_zone",             # 1 if ratio in [0.5, 1.0] — reversion zone
+    "p2s_conversion_rate_5g",       # rolling 5-game scoring drive rate
+    "p2s_conversion_rate_20g",      # rolling 20-game scoring drive rate (baseline)
+    "p2s_cycle_position",           # autocorrelation cycle position (0.0–1.0)
+    "p2s_hot_streak_prob",          # prob current hot streak continues
+    "p2s_cold_streak_prob",         # prob current cold streak continues
+
+    # Defense (opponent's L1 state — fade/confirm signal)
+    "p2s_def_baseline",                 # opponent's avg drives between scoring drives
+    "p2s_def_ratio",           # opponent's current ratio
+    "p2s_def_optimal_zone",         # 1 if opponent offense is in reversion zone
+
+    # ── Layer 2: P2SZ — Possession-to-Scoring Zone cycle baseline ────────────────
+    # Red zone
+    "p2sz_rz_baseline",                 # avg drives between red zone entries
+    "p2sz_rz_ratio",           # current non-RZ streak / rz_baseline
+    "p2sz_rz_optimal_zone",         # 1 if red zone entry rate in reversion zone
+    "p2sz_rz_rate_5g",              # rolling 5-game red zone entry rate
+
+    # Scoring position (inside opp 35)
+    "p2sz_sp_baseline",                 # avg drives between scoring position entries
+    "p2sz_sp_ratio",           # current non-SP streak / sp_baseline
+    "p2sz_sp_optimal_zone",         # 1 if scoring position rate in reversion zone
+    "p2sz_sp_rate_5g",              # rolling 5-game scoring position rate
+
+    # Drive quality
+    "p2sz_yards_per_drive",         # rolling 10-game yards per drive
+    "p2sz_explosive_rate",          # rolling 10-game explosive drive rate (20+ yards)
+    "p2sz_3rd_conv_baseline",           # Cycle baseline on 3rd down conversion rate
+    "p2sz_3rd_conv_optimal_zone",   # 1 if 3rd down rate in reversion zone
+    "p2sz_avg_start_yard_line",     # avg drive start position (opponent field position)
+
+    # ── L1 × L2 Intersection — PRIMARY SIGNAL ───────────────────────────
+    "p2s_p2sz_dual_optimal",        # 1 if BOTH L1 AND L2 in optimal zone
+    "p2s_p2sz_signal_strength",     # sum of L1 ratio + L2 ratio (continuous)
+    "matchup_dual_optimal",         # 1 if this team dual optimal AND opp defense suppressed
+
+    # ── Layer 3: PIC — Player Impact Curve (Phase 3) ────────────────────
+    "pic_composite_l1",             # roster composite PIC_L1
+    "pic_composite_l2",             # roster composite PIC_L2
+    "pic_lineup_delta_l1",          # L1 impact change from this week's roster changes
+    "pic_lineup_delta_l2",          # L2 impact change from this week's roster changes
+    "pic_key_player_active",        # top-3 PIC players active
+    "pic_ol_composite",             # OL PIC_L2 composite
+    "pic_pass_rush_opp",            # opponent pass rush PIC_L1 suppression
+
+    # ── Layer 4: PIM — Personal Impact Measurement (Phase 4) ────────────
+    "pim_trajectory",               # PIM-adjusted trajectory composite
+    "pim_salary_signal",            # salary arbitrage revealed-preference signal
+    "pim_volatility",               # roster reliability (lower = better)
+
+    # ── Contextual / Standard Features ──────────────────────────────────
+    "is_home",                      # 1 if this is the home team row
+    "rest_days",                    # days since last game
+    "rest_advantage",               # rest_days - opponent_rest_days
+    "is_dome",                      # 1 if dome/climate controlled
+    "temp",                         # temperature (°F); 70 if dome
+    "wind_mph",                     # wind speed; 0 if dome
+    "is_cold_game",                 # 1 if temp < 40°F
+    "is_windy_game",                # 1 if wind > 15 mph
+    "is_div_game",                  # 1 if division game
+    "season_week",                  # week number (1-18)
+    "is_playoffs",                  # 1 if playoff game
+    "opening_total",                # opening total line
+    "closing_total",                # closing total line
+    "total_movement",               # closing - opening (sharp signal)
+    "opening_spread",               # opening spread (home perspective)
+    "closing_spread",               # closing spread
+    "spread_movement",              # closing - opening spread
+    "implied_team_score",           # from spread + total
+    "vegas_win_prob",               # market-implied win probability
+    "epa_offense_avg",              # rolling EPA/play offense
+    "epa_defense_avg",              # rolling EPA/play defense (allowed)
+    "scoring_avg_5g",               # rolling 5-game points scored
+    "scoring_avg_20g",              # rolling 20-game points scored
+    "scoring_allowed_avg_5g",       # rolling 5-game points allowed
 ]
 
 
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
-def engineer_features(games_df, drives_df, pbp_df=None, players_df=None,
-                      contracts_df=None, closing_lines_df=None, target="over_total"):
+def engineer_features(
+    games_df: pd.DataFrame,
+    drives_df: pd.DataFrame,
+    pbp_df: pd.DataFrame = None,
+    players_df: pd.DataFrame = None,
+    contracts_df: pd.DataFrame = None,
+    closing_lines_df: pd.DataFrame = None,
+) -> pd.DataFrame:
+    """
+    Build all features from raw NFL data.
+
+    Input:  games_df (game-level), drives_df (drive-level)
+    Output: game-TEAM level rows (~570/season) with all features + target
+
+    Each game becomes TWO rows — one per team (mirrors golf's per-player structure).
+    Features are computed from each team's perspective.
+    """
     t_start = time.time()
+
     logger.info("[FEAT] ============================================================")
     logger.info("[FEAT] NFL FEATURE ENGINEERING PIPELINE START")
-    logger.info(f"[FEAT]   Games: {len(games_df)}, Drives: {len(drives_df)}, Target: {target}")
+    logger.info(f"[FEAT]   Games: {len(games_df)}, Drives: {len(drives_df)}")
     logger.info("[FEAT] ============================================================")
 
     if games_df.empty or drives_df.empty:
-        logger.error("[FEAT] Empty input")
+        logger.error("[FEAT] Empty input — cannot proceed")
         return pd.DataFrame()
 
+    # Step 1: Reshape games to game-team rows
     logger.info("[FEAT] Step 1: Reshaping to game-team rows...")
     df = _reshape_to_game_team(games_df, closing_lines_df)
-    logger.info(f"[FEAT]   {len(df)} game-team rows ({df['team'].nunique()} teams)")
+    logger.info(f"[FEAT]   {len(df)} game-team rows ({df['team'].nunique()} teams, {df['season'].nunique()} seasons)")
 
-    logger.info("[FEAT] Step 2: Building target variables...")
-    df = _build_targets(df, target)
+    # Step 2: Target variable
+    logger.info(f"[FEAT] Step 2: Building target variable ({TARGET_COLUMN})...")
+    df = _build_target(df)
 
+    # Step 3: Layer 1 — PTS cycle baseline
     logger.info("[FEAT] Step 3: Building P2S features (Layer 1)...")
     t3 = time.time()
     df = _build_p2s_features(df, drives_df)
     logger.info(f"[FEAT]   Step 3 done in {time.time()-t3:.1f}s")
 
+    # Step 4: Layer 2 — P2SZ cycle baseline
     logger.info("[FEAT] Step 4: Building P2SZ features (Layer 2)...")
     t4 = time.time()
     df = _build_p2sz_features(df, drives_df)
     logger.info(f"[FEAT]   Step 4 done in {time.time()-t4:.1f}s")
 
+    # Step 5: Intersection features
     logger.info("[FEAT] Step 5: Engineering intersection features...")
     df = _build_intersection_features(df)
 
+    # Step 6: Layer 3 (stub — Phase 3)
     for col in [c for c in FEATURE_COLUMNS if c.startswith("pic_")]:
         df[col] = np.nan
+
+    # Step 7: Layer 4 (stub — Phase 4)
     for col in [c for c in FEATURE_COLUMNS if c.startswith("pim_")]:
         df[col] = np.nan
 
+    # Step 8: Standard / contextual features
     logger.info("[FEAT] Step 8: Building standard features...")
     df = _build_standard_features(df, games_df)
 
+    # Step 9: Validation and cleanup
     logger.info("[FEAT] Step 9: Validation...")
-    df = _validate_and_clean(df, target)
+    df = _validate_and_clean(df)
 
     total = time.time() - t_start
     available = [f for f in FEATURE_COLUMNS if f in df.columns and df[f].notna().any()]
@@ -129,13 +198,33 @@ def engineer_features(games_df, drives_df, pbp_df=None, players_df=None,
 
 
 # ---------------------------------------------------------------------------
-# Step 1: Reshape
+# Step 1: Reshape game-level → game-team rows
 # ---------------------------------------------------------------------------
-def _reshape_to_game_team(games_df, closing_lines_df=None):
+
+def _reshape_to_game_team(
+    games_df: pd.DataFrame,
+    closing_lines_df: pd.DataFrame = None,
+) -> pd.DataFrame:
+    """
+    Convert one-row-per-game to two-rows-per-game (one per team).
+    This mirrors GolfPredictor's natural per-player structure.
+
+    Adds:
+        team, opponent, is_home, team_score, opponent_score,
+        team_spread (from team perspective), team_total_implied
+    """
     rows = []
+
+    logger.info(f"[FEAT] Reshape input: {len(games_df)} games, columns: {sorted(games_df.columns.tolist())}")
+    if "total_line" in games_df.columns:
+        n = games_df["total_line"].notna().sum()
+        logger.info(f"[FEAT] total_line: {n}/{len(games_df)} valid, sample: {games_df['total_line'].dropna().head(3).tolist()}")
+    else:
+        logger.warning("[FEAT] total_line NOT in games_df columns!")
+
+    # Merge closing lines if provided
     if closing_lines_df is not None and not closing_lines_df.empty:
-        merge_cols = [c for c in ["game_id", "closing_spread", "closing_total"]
-                      if c in closing_lines_df.columns]
+        merge_cols = [c for c in ["game_id", "closing_spread", "closing_total"] if c in closing_lines_df.columns]
         if "game_id" in merge_cols:
             games_df = games_df.merge(closing_lines_df[merge_cols], on="game_id", how="left")
 
@@ -147,123 +236,188 @@ def _reshape_to_game_team(games_df, closing_lines_df=None):
             "game_type": game.get("game_type", "REG"),
             "gameday": game.get("gameday"),
             "opening_total": pd.to_numeric(game.get("total_line"), errors="coerce"),
+            # closing_total: ONLY from closing_lines_df merge above — not from total_line.
+            # If closing_lines_df wasn't provided, this stays NaN and _build_target
+            # will log an error and produce NaN targets (rows dropped).
             "closing_total": pd.to_numeric(game.get("closing_total"), errors="coerce"),
             "is_dome": int(game.get("is_dome", 0)),
             "temp": float(game.get("temp", 70)) if game.get("is_dome", 0) == 1 else float(game.get("temp", 55)),
-            "wind_mph": 0.0 if game.get("is_dome", 0) == 1 else float(game.get("wind", 0)),
+            "wind_mph": float(game.get("wind", 0)) if game.get("is_dome", 0) == 1 else float(game.get("wind", 0)),
             "is_div_game": int(game.get("div_game", 0)),
             "season_week": game.get("week"),
             "is_playoffs": int(game.get("game_type", "REG") != "REG"),
         }
+
+        # Home team row
         home_spread = pd.to_numeric(game.get("spread_line"), errors="coerce")
         closing_spread = pd.to_numeric(game.get("closing_spread", game.get("spread_line")), errors="coerce")
+        home_row = {
+            **base,
+            "team": game["home_team"],
+            "opponent": game["away_team"],
+            "is_home": 1,
+            "team_score": pd.to_numeric(game.get("home_score"), errors="coerce"),
+            "opponent_score": pd.to_numeric(game.get("away_score"), errors="coerce"),
+            "opening_spread": home_spread,   # negative = home favored
+            "closing_spread": closing_spread,
+        }
 
-        home_row = {**base, "team": game["home_team"], "opponent": game["away_team"],
-                    "is_home": 1,
-                    "team_score": pd.to_numeric(game.get("home_score"), errors="coerce"),
-                    "opponent_score": pd.to_numeric(game.get("away_score"), errors="coerce"),
-                    "opening_spread": home_spread, "closing_spread": closing_spread}
-        away_row = {**base, "team": game["away_team"], "opponent": game["home_team"],
-                    "is_home": 0,
-                    "team_score": pd.to_numeric(game.get("away_score"), errors="coerce"),
-                    "opponent_score": pd.to_numeric(game.get("home_score"), errors="coerce"),
-                    "opening_spread": -home_spread if pd.notna(home_spread) else np.nan,
-                    "closing_spread": -closing_spread if pd.notna(closing_spread) else np.nan}
+        # Away team row (flip spread sign)
+        away_row = {
+            **base,
+            "team": game["away_team"],
+            "opponent": game["home_team"],
+            "is_home": 0,
+            "team_score": pd.to_numeric(game.get("away_score"), errors="coerce"),
+            "opponent_score": pd.to_numeric(game.get("home_score"), errors="coerce"),
+            "opening_spread": -home_spread if pd.notna(home_spread) else np.nan,
+            "closing_spread": -closing_spread if pd.notna(closing_spread) else np.nan,
+        }
+
         rows.extend([home_row, away_row])
 
     df = pd.DataFrame(rows)
-    df["spread_movement"] = df["closing_spread"] - df["opening_spread"]
-    df["total_movement"] = df["closing_total"] - df["opening_total"]
-    df["total_points"] = df["team_score"] + df["opponent_score"]
-    df["result"] = df["team_score"] - df["opponent_score"]
-    df["implied_team_score"] = (df["closing_total"] - df["closing_spread"]) / 2
 
+    # Debug: check key columns made it through
+    for col in ["opening_total", "closing_total", "team_score", "opponent_score", "is_home"]:
+        if col in df.columns:
+            n_valid = df[col].notna().sum()
+            logger.info(f"[FEAT] Reshape check: {col} — {n_valid}/{len(df)} valid")
+        else:
+            logger.warning(f"[FEAT] Reshape check: {col} — MISSING from DataFrame")
+
+    # Derived contextual features
+    df["spread_movement"] = df.get("closing_spread", np.nan) - df.get("opening_spread", np.nan)
+    df["total_movement"] = df.get("closing_total", np.nan) - df.get("opening_total", np.nan)
+    df["total_points"] = df["team_score"] + df["opponent_score"]
+    df["result"] = df["team_score"] - df["opponent_score"]  # positive = win
+
+    # Implied team score from spread + total
+    closing_total = df.get("closing_total", df.get("opening_total", np.nan))
+    closing_spread = df.get("closing_spread", df.get("opening_spread", np.nan))
+    df["implied_team_score"] = (closing_total - closing_spread) / 2
+
+    # Vegas win probability from spread
+    # Approximation: win_prob ≈ norm.cdf(-spread / 13.45)
     from scipy.stats import norm
     df["vegas_win_prob"] = df["closing_spread"].apply(
-        lambda s: norm.cdf(-s / 13.45) if pd.notna(s) else 0.5)
+        lambda s: norm.cdf(-s / 13.45) if pd.notna(s) else 0.5
+    )
+
+    # Weather adjustments
     df["is_cold_game"] = (df["temp"] < 40).astype(int)
     df["is_windy_game"] = (df["wind_mph"] > 15).astype(int)
 
+    # Sort chronologically
     if "gameday" in df.columns:
         df = df.sort_values(["gameday", "game_id", "is_home"], ascending=[True, True, False])
-    return df.reset_index(drop=True)
+    df = df.reset_index(drop=True)
 
-
-# ---------------------------------------------------------------------------
-# Step 2: Targets
-# ---------------------------------------------------------------------------
-def _build_targets(df, primary_target="over_total"):
-    # over_total
-    if "closing_total" in df.columns:
-        df["over_total"] = (df["total_points"] > df["closing_total"]).astype(float)
-        df.loc[df["closing_total"].isna() | df["total_points"].isna(), "over_total"] = np.nan
-    else:
-        logger.error("[FEAT] 'closing_total' MISSING -- over_total will be NaN")
-        df["over_total"] = np.nan
-
-    # beat_spread
-    if "closing_spread" in df.columns:
-        df["beat_spread"] = (df["result"] + df["closing_spread"] > 0).astype(float)
-        df.loc[df["closing_spread"].isna() | df["result"].isna(), "beat_spread"] = np.nan
-    else:
-        df["beat_spread"] = np.nan
-
-    # win_game
-    df["win_game"] = (df["result"] > 0).astype(float)
-    df.loc[df["result"].isna(), "win_game"] = np.nan
-    df.loc[df["result"] == 0, "win_game"] = np.nan
-
-    # team_over
-    if "implied_team_score" in df.columns:
-        df["team_over"] = (df["team_score"] > df["implied_team_score"]).astype(float)
-        df.loc[df["implied_team_score"].isna() | df["team_score"].isna(), "team_over"] = np.nan
-    else:
-        df["team_over"] = np.nan
-
-    target_col = TARGET_COLUMNS.get(primary_target, primary_target)
-    if target_col in df.columns:
-        n_valid = df[target_col].notna().sum()
-        pos_rate = df[target_col].mean()
-        logger.info(f"[FEAT]   Primary target '{target_col}': {n_valid}/{len(df)} valid, {pos_rate:.3f} positive rate")
     return df
 
 
 # ---------------------------------------------------------------------------
-# Core cycle baseline engine
+# Step 2: Target variable
 # ---------------------------------------------------------------------------
-def _compute_cycle_sequence(miss_flags, min_gaps=3):
+
+def _build_target(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build binary target: did the game go over the total line?
+    Uses closing_total if available (preferred — sharpest number).
+    Falls back to total_line (opening line) if closing_total is absent.
+    """
+    # Determine which total to use
+    if "closing_total" in df.columns and df["closing_total"].notna().sum() > 0:
+        total_col = "closing_total"
+        logger.info(f"[FEAT] Using closing_total for target ({df['closing_total'].notna().sum()} valid)")
+    elif "opening_total" in df.columns and df["opening_total"].notna().sum() > 0:
+        total_col = "opening_total"
+        logger.warning("[FEAT] closing_total unavailable — falling back to opening_total")
+    elif "total_line" in df.columns and df["total_line"].notna().sum() > 0:
+        total_col = "total_line"
+        logger.warning("[FEAT] closing_total unavailable — falling back to total_line (opening line)")
+    else:
+        logger.error("[FEAT] No total line column found — target will be all NaN")
+        df[TARGET_COLUMN] = np.nan
+        return df
+
+    n_missing = df[total_col].isna().sum()
+    if n_missing > 0:
+        logger.warning(f"[FEAT] {total_col} is NaN for {n_missing}/{len(df)} rows — those rows will be dropped")
+
+    df[TARGET_COLUMN] = (df["total_points"] > df[total_col]).astype(float)
+    df.loc[df[total_col].isna() | df["total_points"].isna(), TARGET_COLUMN] = np.nan
+
+    pos_rate = df[TARGET_COLUMN].mean()
+    n_valid = df[TARGET_COLUMN].notna().sum()
+    logger.info(
+        f"[FEAT]   Target '{TARGET_COLUMN}': {n_valid}/{len(df)} valid rows, "
+        f"{pos_rate:.3f} positive rate "
+        f"(expect ~0.49-0.51 vs closing line)"
+    )
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Core cycle baseline engine — shared by L1 and L2
+# ---------------------------------------------------------------------------
+
+def _compute_cycle_sequence(miss_flags: np.ndarray, min_gaps: int = 3) -> tuple:
+    """
+    Core cycle baseline computation — same math as GolfPredictor, NFL-appropriate terminology.
+
+    Args:
+        miss_flags: binary array (1 = miss/non-event, 0 = hit/event)
+        min_gaps:   minimum observed gaps before cycle baseline is valid
+
+    Returns:
+        (baseline_values, ratio_values, streak_values, zone_values) — all length n
+        All values are NaN until min_gaps gaps have been observed.
+    """
     n = len(miss_flags)
     baseline_values = np.full(n, np.nan)
     ratio_values = np.full(n, np.nan)
     streak_values = np.full(n, np.nan)
     zone_values = np.full(n, np.nan)
-    gaps = []
-    current_gap = 0
-    current_streak = 0
+
+    gaps = []          # completed gaps between miss events
+    current_gap = 0    # drives since last miss
+    current_streak = 0 # consecutive miss events
 
     for i in range(n):
         v = miss_flags[i]
         if np.isnan(v):
             continue
-        if v == 1:
+
+        if v == 1:  # miss event (non-scoring drive)
             if current_gap > 0:
                 gaps.append(current_gap)
             current_gap = 0
             current_streak += 1
-        else:
+        else:       # hit event (scoring drive)
             current_gap += 1
             current_streak = 0
+
+        # Need min_gaps completed gaps for a valid cycle baseline baseline
         if len(gaps) >= min_gaps:
             baseline_values[i] = float(np.mean(gaps))
             if baseline_values[i] > 0:
                 ratio_values[i] = current_gap / baseline_values[i]
+                # Optimal zone: [0.5, 1.0] — overdue for next event, prime reversion
                 zone_values[i] = 1.0 if 0.5 <= ratio_values[i] <= 1.0 else 0.0
+
         streak_values[i] = float(current_streak)
 
     return baseline_values, ratio_values, streak_values, zone_values
 
 
-def _compute_bsr_features(values, min_history=15):
+def _compute_bsr_features(values: np.ndarray, min_history: int = 15) -> dict:
+    """
+    BSR (Baseline Scoring Rhythm) — autocorrelation cycle detection.
+    Mirrors GolfPredictor _player_bsr().
+
+    Returns dict with cycle_position, hot_streak_prob, cold_streak_prob, trend.
+    """
     n = len(values)
     cycle_position = np.full(n, np.nan)
     hot_prob = np.full(n, np.nan)
@@ -276,22 +430,28 @@ def _compute_bsr_features(values, min_history=15):
         if len(valid) < min_history:
             continue
 
+        # Autocorrelation for cycle detection
         centered = valid - np.mean(valid)
         if np.std(centered) > 0:
             ac = np.correlate(centered, centered, mode="full")
             ac = ac[len(ac) // 2:]
             ac = ac / ac[0] if ac[0] != 0 else ac
-            peaks = [j for j in range(2, min(len(ac) - 1, 20))
-                     if ac[j] > ac[j-1] and ac[j] > ac[j+1] and ac[j] > 0.15]
+
+            peaks = [
+                j for j in range(2, min(len(ac) - 1, 20))
+                if ac[j] > ac[j-1] and ac[j] > ac[j+1] and ac[j] > 0.15
+            ]
             if peaks:
                 cycle_len = peaks[0]
                 rounds_since = len(valid) % cycle_len
                 cycle_position[i] = rounds_since / cycle_len
 
+        # Hot/cold streak probability
         recent = valid[-5:] if len(valid) >= 5 else valid
         good = np.sum(recent > np.mean(valid))
         bad = np.sum(recent < np.mean(valid))
 
+        # Compute transition rates from history
         g2g = bad2b = g_total = b_total = 0
         for j in range(1, len(valid)):
             if valid[j-1] > np.mean(valid):
@@ -315,31 +475,49 @@ def _compute_bsr_features(values, min_history=15):
         else:
             hot_prob[i] = cold_prob[i] = 0.5
 
+        # Trend (slope of last 5 values)
         if len(valid) >= 5:
             last5 = valid[-5:]
             slope = np.polyfit(np.arange(5), last5, 1)[0]
             trend[i] = slope
 
-    return {"cycle_position": cycle_position, "hot_prob": hot_prob,
-            "cold_prob": cold_prob, "trend": trend}
+    return {
+        "cycle_position": cycle_position,
+        "hot_prob": hot_prob,
+        "cold_prob": cold_prob,
+        "trend": trend,
+    }
 
 
 # ---------------------------------------------------------------------------
-# Step 3: Layer 1 -- P2S
+# Step 3: Layer 1 — P2S features
 # ---------------------------------------------------------------------------
-def _build_p2s_features(df, drives_df):
+
+def _build_p2s_features(df: pd.DataFrame, drives_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute P2S (Possession-to-Score) cycle baseline for each team.
+
+    For each game-team row, we need the cycle baseline state computed from all drives
+    BEFORE this game. This is the pre-game signal.
+
+    Drive unit: a non-garbage-time offensive possession.
+    Miss:  non-scoring drive (punt, turnover, turnover on downs, missed FG).
+    Hit:   scoring drive (TD or FG).
+    """
     required = ["game_id", "posteam", "is_miss", "is_scoring_drive", "is_countable_drive"]
     missing = [c for c in required if c not in drives_df.columns]
     if missing:
-        logger.warning(f"[FEAT] P2S: drives_df missing {missing} -- filling NaN")
+        logger.warning(f"[FEAT] PTS: drives_df missing {missing} — filling NaN")
         for col in [c for c in FEATURE_COLUMNS if c.startswith("p2s_")]:
             df[col] = np.nan
         return df
 
-    countable = drives_df[drives_df["is_countable_drive"] == 1].copy()
-    sort_cols = [c for c in ["game_date", "game_id", "drive_id"] if c in countable.columns]
-    drives_sorted = countable.sort_values(sort_cols).copy()
+    # Sort drives chronologically
+    sort_cols = [c for c in ["game_date", "game_id", "drive_id"] if c in drives_df.columns]
+    drives_sorted = drives_df.sort_values(sort_cols).copy()
 
+    # Build per-team drive sequences and compute cycle baseline
+    # Result: dict of (team, game_id) → feature dict
     team_game_features = {}
     teams_processed = 0
 
@@ -348,21 +526,31 @@ def _build_p2s_features(df, drives_df):
         score_flags = team_drives["is_scoring_drive"].values.astype(float)
         game_ids = team_drives["game_id"].values
 
+        # Compute cycle baseline sequence over all drives (ordered chronologically)
         baseline_vals, ratio_vals, streak_vals, zone_vals = _compute_cycle_sequence(miss_flags)
+
+        # Compute BSR on scoring rate signal
+        # Convert to binary per-drive scoring rate per game first
         bsr = _compute_bsr_features(score_flags)
 
+        # Compute rolling scoring rates
         scoring_series = pd.Series(score_flags)
-        conv_5g_raw = scoring_series.rolling(window=40, min_periods=10).mean()
-        conv_20g_raw = scoring_series.rolling(window=160, min_periods=40).mean()
+        conv_5g_raw = scoring_series.rolling(window=40, min_periods=10).mean()   # ~8 drives/game × 5 games
+        conv_20g_raw = scoring_series.rolling(window=160, min_periods=40).mean() # ~8 × 20 games
 
+        # Map drive-level features back to game level
+        # For each game, take the LAST drive's feature values (pre-game state would be
+        # the values computed at end of previous game — but since we use shift below, this
+        # represents the state at the END of the last drive of this game, and we shift by
+        # one game when merging. This is correct: we want the state GOING INTO the game.)
         game_indices = {}
-        for idx, gid in enumerate(game_ids):
+        for idx, (drive_idx, gid) in enumerate(zip(range(len(game_ids)), game_ids)):
             if gid not in game_indices:
                 game_indices[gid] = []
             game_indices[gid].append(idx)
 
         for gid, idxs in game_indices.items():
-            last_idx = idxs[-1]
+            last_idx = idxs[-1]  # last drive of this game
             team_game_features[(team, gid)] = {
                 "p2s_baseline": baseline_vals[last_idx],
                 "p2s_ratio": ratio_vals[last_idx],
@@ -374,97 +562,124 @@ def _build_p2s_features(df, drives_df):
                 "p2s_hot_streak_prob": bsr["hot_prob"][last_idx],
                 "p2s_cold_streak_prob": bsr["cold_prob"][last_idx],
             }
+
         teams_processed += 1
         if teams_processed % 8 == 0:
-            logger.info(f"[FEAT]   P2S: processed {teams_processed} teams...")
+            logger.info(f"[FEAT]   PTS: processed {teams_processed} teams...")
 
-    logger.info(f"[FEAT]   P2S: computed {len(team_game_features)} team-game records")
-    df = _merge_lagged_features(df, team_game_features, "p2s_", drives_sorted)
+    logger.info(f"[FEAT]   PTS: computed {len(team_game_features)} team-game records")
 
-    # Defensive P2S
+    # Join offensive features — using PREVIOUS game's values (shift by 1 game per team)
+    df = _merge_lagged_features(df, team_game_features, "p2s_", drives_df)
+
+    # Defensive PTS: opponent's OFFENSIVE L1 state, also using PREVIOUS game lag.
+    # We want to know: going into this game, how has the opponent's offense been performing?
+    # This uses the SAME lagged team_game_features dict (already shifted by _merge_lagged_features)
+    # but looked up from the opponent's perspective.
+    #
+    # IMPORTANT: We must use the opponent's state BEFORE the current game — i.e., the
+    # opponent's end-of-last-game state. Since team_game_features stores end-of-game state
+    # keyed by (team, game_id), and _merge_lagged_features already shifts by one game,
+    # we need to do the same shift for defensive lookups.
+    #
+    # Build a prev_game_id map for opponents too.
     game_order = (
-        drives_sorted.drop_duplicates(subset=["game_id", "posteam"])
-        .sort_values([c for c in ["game_date", "game_id"] if c in drives_sorted.columns])
-        [["game_id", "posteam"]].rename(columns={"posteam": "team"})
+        drives_df.drop_duplicates(subset=["game_id", "posteam"])
+        .sort_values([c for c in ["game_date", "game_id"] if c in drives_df.columns])
+        [["game_id", "posteam"]]
+        .rename(columns={"posteam": "team"})
     )
     game_order["prev_game_id"] = game_order.groupby("team")["game_id"].shift(1)
     prev_game_map = game_order.set_index(["team", "game_id"])["prev_game_id"].to_dict()
 
+    # For each row, look up opponent's state from opponent's PREVIOUS game
     def _get_def_feature(row, feat_key):
-        prev_gid = prev_game_map.get((row["opponent"], row["game_id"]))
+        opponent = row["opponent"]
+        game_id = row["game_id"]
+        # Get the opponent's previous game_id
+        prev_gid = prev_game_map.get((opponent, game_id))
         if prev_gid is None:
             return np.nan
-        return team_game_features.get((row["opponent"], prev_gid), {}).get(feat_key, np.nan)
+        return team_game_features.get((opponent, prev_gid), {}).get(feat_key, np.nan)
 
-    logger.info("[FEAT]   Computing defensive P2S features...")
+    logger.info("[FEAT]   Computing defensive PTS features (opponent pre-game state)...")
     df["p2s_def_baseline"] = df.apply(lambda r: _get_def_feature(r, "p2s_baseline"), axis=1)
     df["p2s_def_ratio"] = df.apply(lambda r: _get_def_feature(r, "p2s_ratio"), axis=1)
     df["p2s_def_optimal_zone"] = df.apply(lambda r: _get_def_feature(r, "p2s_optimal_zone"), axis=1)
 
     def_valid = df["p2s_def_baseline"].notna().sum()
-    logger.info(f"[FEAT]   Defensive P2S: {def_valid}/{len(df)} rows have data")
+    logger.info(f"[FEAT]   Defensive PTS features: {def_valid}/{len(df)} rows have data")
+
     return df
 
 
 # ---------------------------------------------------------------------------
-# Step 4: Layer 2 -- P2SZ
+# Step 4: Layer 2 — P2SZ features
 # ---------------------------------------------------------------------------
-def _build_p2sz_features(df, drives_df):
-    required_cols = ["game_id", "posteam", "reached_redzone", "reached_scoring_position",
-                     "is_countable_drive"]
+
+def _build_p2sz_features(df: pd.DataFrame, drives_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute P2SZ (Possession-to-Scoring Zone) cycle baseline for each team.
+
+    Identical computation to PTS, but applied to FIELD POSITION signals
+    rather than scoring signals. This creates an independent cycle.
+
+    Miss (red zone cycle baseline):  drive that doesn't reach opponent's 20
+    Hit:                   drive that enters red zone
+    Miss (SP cycle baseline):        drive that doesn't reach opponent's 35
+    Hit:                   drive that reaches scoring position
+    """
+    required_cols = ["game_id", "posteam", "reached_redzone", "reached_scoring_position"]
     missing = [c for c in required_cols if c not in drives_df.columns]
     if missing:
-        logger.warning(f"[FEAT] P2SZ: drives_df missing {missing} -- filling NaN")
+        logger.warning(f"[FEAT] P2SZ: drives_df missing {missing} — filling NaN")
         for col in [c for c in FEATURE_COLUMNS if c.startswith("p2sz_")]:
             df[col] = np.nan
         return df
 
-    countable = drives_df[drives_df["is_countable_drive"] == 1].copy()
-    sort_cols = [c for c in ["game_date", "game_id", "drive_id"] if c in countable.columns]
-    drives_sorted = countable.sort_values(sort_cols).copy()
+    sort_cols = [c for c in ["game_date", "game_id", "drive_id"] if c in drives_df.columns]
+    drives_sorted = drives_df.sort_values(sort_cols).copy()
 
     team_game_features = {}
     teams_processed = 0
 
     for team, team_drives in drives_sorted.groupby("posteam"):
+        # Red zone cycle baseline: miss = didn't enter red zone
         rz_miss = (1 - team_drives["reached_redzone"].values).astype(float)
         rz_baseline, rz_ratio, _, rz_zone = _compute_cycle_sequence(rz_miss)
 
+        # Scoring position cycle baseline: miss = didn't reach inside opp 35
         sp_miss = (1 - team_drives["reached_scoring_position"].values).astype(float)
         sp_baseline, sp_ratio, _, sp_zone = _compute_cycle_sequence(sp_miss)
 
-        n_drives = len(team_drives)
+        # 3rd down conversion cycle baseline
         if "third_down_conv_rate" in team_drives.columns:
             td_conv = team_drives["third_down_conv_rate"].values.astype(float)
+            # Miss = below-average 3rd down conversion (per-drive rate)
             td_avg = np.nanmean(td_conv)
-            td_miss = np.where(np.isnan(td_conv), np.nan, (td_conv < td_avg).astype(float))
-            td_baseline, _, _, td_zone = _compute_cycle_sequence(td_miss)
+            td_miss = (td_conv < td_avg).astype(float)
+            td_miss[np.isnan(td_conv)] = np.nan
+            td_baseline, td_ratio, _, td_zone = _compute_cycle_sequence(td_miss)
         else:
-            td_baseline = td_zone = np.full(n_drives, np.nan)
+            n = len(team_drives)
+            td_baseline = td_ratio = td_zone = np.full(n, np.nan)
 
+        # Rolling rates
         rz_series = pd.Series(team_drives["reached_redzone"].values.astype(float))
         sp_series = pd.Series(team_drives["reached_scoring_position"].values.astype(float))
         rz_5g = rz_series.rolling(window=40, min_periods=10).mean()
         sp_5g = sp_series.rolling(window=40, min_periods=10).mean()
 
-        if "drive_yards_gained" in team_drives.columns:
-            yds = pd.Series(team_drives["drive_yards_gained"].values.astype(float))
-            yds_per_drive = yds.rolling(window=80, min_periods=16).mean()
-        else:
-            yds_per_drive = pd.Series(np.nan, index=range(n_drives))
+        # Rolling drive quality
+        yds_per_drive = pd.Series(
+            team_drives.get("drive_yards_gained", pd.Series(np.nan, index=team_drives.index))
+        ).rolling(window=80, min_periods=16).mean()  # ~8 drives/game × 10 games
 
-        if "is_explosive_drive" in team_drives.columns:
-            exp_rate = pd.Series(team_drives["is_explosive_drive"].values.astype(float))
-            explosive_rate = exp_rate.rolling(window=80, min_periods=16).mean()
-        else:
-            explosive_rate = pd.Series(0.0, index=range(n_drives))
+        explosive_rate = pd.Series(
+            team_drives.get("is_explosive_drive", pd.Series(0, index=team_drives.index))
+        ).rolling(window=80, min_periods=16).mean()
 
-        if "start_yard_line" in team_drives.columns:
-            syl = pd.Series(team_drives["start_yard_line"].values.astype(float))
-            avg_start = syl.rolling(window=80, min_periods=8).mean()
-        else:
-            avg_start = pd.Series(np.nan, index=range(n_drives))
-
+        # Group by game — take last drive of each game
         game_ids = team_drives["game_id"].values
         game_indices = {}
         for idx, gid in enumerate(game_ids):
@@ -473,35 +688,46 @@ def _build_p2sz_features(df, drives_df):
             game_indices[gid].append(idx)
 
         for gid, idxs in game_indices.items():
-            li = idxs[-1]
+            last_idx = idxs[-1]
             team_game_features[(team, gid)] = {
-                "p2sz_rz_baseline": rz_baseline[li],
-                "p2sz_rz_ratio": rz_ratio[li],
-                "p2sz_rz_optimal_zone": rz_zone[li],
-                "p2sz_rz_rate_5g": rz_5g.iloc[li],
-                "p2sz_sp_baseline": sp_baseline[li],
-                "p2sz_sp_ratio": sp_ratio[li],
-                "p2sz_sp_optimal_zone": sp_zone[li],
-                "p2sz_sp_rate_5g": sp_5g.iloc[li],
-                "p2sz_3rd_conv_baseline": td_baseline[li] if not np.isnan(td_baseline[li]) else np.nan,
-                "p2sz_3rd_conv_optimal_zone": td_zone[li] if not np.isnan(td_zone[li]) else np.nan,
-                "p2sz_yards_per_drive": yds_per_drive.iloc[li],
-                "p2sz_explosive_rate": explosive_rate.iloc[li],
-                "p2sz_avg_start_yard_line": avg_start.iloc[li],
+                "p2sz_rz_baseline": rz_baseline[last_idx],
+                "p2sz_rz_ratio": rz_ratio[last_idx],
+                "p2sz_rz_optimal_zone": rz_zone[last_idx],
+                "p2sz_rz_rate_5g": rz_5g.iloc[last_idx],
+                "p2sz_sp_baseline": sp_baseline[last_idx],
+                "p2sz_sp_ratio": sp_ratio[last_idx],
+                "p2sz_sp_optimal_zone": sp_zone[last_idx],
+                "p2sz_sp_rate_5g": sp_5g.iloc[last_idx],
+                "p2sz_3rd_conv_baseline": td_baseline[last_idx] if not np.isnan(td_baseline[last_idx]) else np.nan,
+                "p2sz_3rd_conv_optimal_zone": td_zone[last_idx] if not np.isnan(td_zone[last_idx]) else np.nan,
+                "p2sz_yards_per_drive": yds_per_drive.iloc[last_idx],
+                "p2sz_explosive_rate": explosive_rate.iloc[last_idx],
+                "p2sz_avg_start_yard_line": (
+                    team_drives["start_yard_line"].rolling(window=80, min_periods=8).mean().iloc[last_idx]
+                    if "start_yard_line" in team_drives.columns else np.nan
+                ),
             }
+
         teams_processed += 1
         if teams_processed % 8 == 0:
             logger.info(f"[FEAT]   P2SZ: processed {teams_processed} teams...")
 
     logger.info(f"[FEAT]   P2SZ: computed {len(team_game_features)} team-game records")
-    df = _merge_lagged_features(df, team_game_features, "p2sz_", drives_sorted)
+    df = _merge_lagged_features(df, team_game_features, "p2sz_", drives_df)
+
     return df
 
 
 # ---------------------------------------------------------------------------
-# Step 5: Intersection features
+# Step 5: Intersection features — THE PRIMARY SIGNAL
 # ---------------------------------------------------------------------------
-def _build_intersection_features(df):
+
+def _build_intersection_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Engineer L1 × L2 interaction signals explicitly.
+    Not learned — these are engineered because the interaction is the hypothesis.
+    """
+    # Dual optimal: both L1 (scoring suppressed) AND L2 (drive quality suppressed) together
     has_l1 = "p2s_optimal_zone" in df.columns
     has_l2 = "p2sz_sp_optimal_zone" in df.columns
 
@@ -509,111 +735,161 @@ def _build_intersection_features(df):
         df["p2s_p2sz_dual_optimal"] = (
             (df["p2s_optimal_zone"] == 1.0) & (df["p2sz_sp_optimal_zone"] == 1.0)
         ).astype(float)
-        df.loc[df["p2s_optimal_zone"].isna() | df["p2sz_sp_optimal_zone"].isna(),
-               "p2s_p2sz_dual_optimal"] = np.nan
+        df.loc[df["p2s_optimal_zone"].isna() | df["p2sz_sp_optimal_zone"].isna(), "p2s_p2sz_dual_optimal"] = np.nan
 
-        if "p2s_ratio" in df.columns and "p2sz_sp_ratio" in df.columns:
+        # Signal strength: continuous version (sum of both ratios, normalized)
+        has_r1 = "p2s_ratio" in df.columns
+        has_r2 = "p2sz_sp_ratio" in df.columns
+        if has_r1 and has_r2:
+            # Clip ratios to [0, 2] range — beyond 2 means very overdue but also data may be sparse
             r1 = df["p2s_ratio"].clip(0, 2).fillna(0)
             r2 = df["p2sz_sp_ratio"].clip(0, 2).fillna(0)
             df["p2s_p2sz_signal_strength"] = (r1 + r2) / 2
         else:
             df["p2s_p2sz_signal_strength"] = np.nan
 
+        # Matchup edge: THIS team in dual optimal AND opponent defense is suppressed
+        # (opponent's L1 optimal zone means their OFFENSE hasn't been scoring — but
+        # we want opponent's DEFENSE to be suppressed, which means their defense
+        # hasn't been stopping scoring. Proxy: opponent's p2s_def_ratio is high)
         if "p2s_def_ratio" in df.columns:
             df["matchup_dual_optimal"] = (
-                (df["p2s_p2sz_dual_optimal"] == 1.0) & (df["p2s_def_ratio"] > 1.0)
+                (df["p2s_p2sz_dual_optimal"] == 1.0) &
+                (df["p2s_def_ratio"] > 1.0)  # opponent defense overdue for giving up points
             ).astype(float)
         else:
             df["matchup_dual_optimal"] = np.nan
+
     else:
         df["p2s_p2sz_dual_optimal"] = np.nan
         df["p2s_p2sz_signal_strength"] = np.nan
         df["matchup_dual_optimal"] = np.nan
 
+    # Log intersection statistics
     if "p2s_p2sz_dual_optimal" in df.columns:
         n_dual = (df["p2s_p2sz_dual_optimal"] == 1.0).sum()
         n_valid = df["p2s_p2sz_dual_optimal"].notna().sum()
-        if n_valid > 0:
-            logger.info(f"[FEAT]   Dual optimal: {n_dual}/{n_valid} ({n_dual/n_valid*100:.1f}%)")
+        logger.info(f"[FEAT]   Dual optimal: {n_dual}/{n_valid} game-team rows ({n_dual/n_valid*100:.1f}% if valid)")
+
     return df
 
 
 # ---------------------------------------------------------------------------
-# Step 8: Standard features
+# Step 8: Standard contextual features
 # ---------------------------------------------------------------------------
-def _build_standard_features(df, games_df):
+
+def _build_standard_features(df: pd.DataFrame, games_df: pd.DataFrame) -> pd.DataFrame:
+    """Build EPA rolling averages, scoring averages, rest, weather."""
+
+    # Rest days computation
     if "gameday" in df.columns:
         df["gameday"] = pd.to_datetime(df["gameday"])
         df = df.sort_values(["team", "gameday"])
         df["prev_gameday"] = df.groupby("team")["gameday"].shift(1)
         df["rest_days"] = (df["gameday"] - df["prev_gameday"]).dt.days
-        df["rest_days"] = df["rest_days"].fillna(7).clip(4, 21)
+        df["rest_days"] = df["rest_days"].fillna(7).clip(4, 21)  # cap at reasonable range
 
+        # Rest advantage vs. opponent
         rest_map = df.set_index(["game_id", "team"])["rest_days"].to_dict()
         df["opponent_rest"] = df.apply(
-            lambda r: rest_map.get((r["game_id"], r["opponent"]), np.nan), axis=1)
+            lambda r: rest_map.get((r["game_id"], r["opponent"]), np.nan), axis=1
+        )
         df["rest_advantage"] = df["rest_days"] - df["opponent_rest"]
 
+    # Build EPA rolling averages from games data — need to join EPA back
+    # nflfastR pbp has EPA by team — we'll use game-level agg if available
     if "epa_offense_avg" not in df.columns:
         df["epa_offense_avg"] = np.nan
         df["epa_defense_avg"] = np.nan
 
+    # Rolling scoring averages (from team_score column)
     if "team_score" in df.columns:
         df["scoring_avg_5g"] = df.groupby("team")["team_score"].transform(
-            lambda x: x.shift(1).rolling(window=5, min_periods=2).mean())
+            lambda x: x.shift(1).rolling(window=5, min_periods=2).mean()
+        )
         df["scoring_avg_20g"] = df.groupby("team")["team_score"].transform(
-            lambda x: x.shift(1).rolling(window=20, min_periods=5).mean())
+            lambda x: x.shift(1).rolling(window=20, min_periods=5).mean()
+        )
+
     if "opponent_score" in df.columns:
         df["scoring_allowed_avg_5g"] = df.groupby("team")["opponent_score"].transform(
-            lambda x: x.shift(1).rolling(window=5, min_periods=2).mean())
+            lambda x: x.shift(1).rolling(window=5, min_periods=2).mean()
+        )
+
     return df
 
 
 # ---------------------------------------------------------------------------
-# Merge helper
+# Merge helper — join lagged features to game-team rows
 # ---------------------------------------------------------------------------
-def _merge_lagged_features(df, team_game_features, prefix, drives_df):
-    if not team_game_features:
-        return df
 
+def _merge_lagged_features(
+    df: pd.DataFrame,
+    team_game_features: dict,
+    prefix: str,
+    drives_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Merge drive-level computed features onto game-team rows.
+
+    CRITICAL: We want the state BEFORE the current game, not including it.
+    So we look up the feature values from the PREVIOUS game's end state.
+
+    For each (team, game_id) row, look up features from (team, prev_game_id).
+    """
+    # Build ordered game list per team from drives
     game_order = (
         drives_df.drop_duplicates(subset=["game_id", "posteam"])
         .sort_values([c for c in ["game_date", "game_id"] if c in drives_df.columns])
-        [["game_id", "posteam"]].rename(columns={"posteam": "team"})
+        [["game_id", "posteam"]]
+        .rename(columns={"posteam": "team"})
     )
+
+    # Create prev_game_id mapping
     game_order["prev_game_id"] = game_order.groupby("team")["game_id"].shift(1)
     prev_game_map = game_order.set_index(["team", "game_id"])["prev_game_id"].to_dict()
 
-    feature_cols = list(next(iter(team_game_features.values())).keys())
+    # Map features from previous game's state
+    feature_cols = [c for c in list(team_game_features.values())[0].keys()] if team_game_features else []
 
     for col in feature_cols:
         if col.startswith(prefix.rstrip("_")) or col.startswith(prefix):
             col_data = []
             for _, row in df.iterrows():
-                prev_gid = prev_game_map.get((row["team"], row["game_id"]))
-                feats = team_game_features.get((row["team"], prev_gid), {}) if prev_gid else {}
+                team = row["team"]
+                gid = row["game_id"]
+                prev_gid = prev_game_map.get((team, gid))
+                if prev_gid is not None:
+                    feats = team_game_features.get((team, prev_gid), {})
+                else:
+                    feats = {}
                 col_data.append(feats.get(col, np.nan))
             df[col] = col_data
 
-    sample = [c for c in feature_cols if c.startswith(prefix.rstrip("_")) or c.startswith(prefix)]
-    if sample and sample[0] in df.columns:
-        valid = df[sample[0]].notna().sum()
-        logger.info(f"[FEAT]   {prefix}* merged: {valid}/{len(df)} rows have data")
+    # Log coverage
+    if feature_cols:
+        sample_col = feature_cols[0]
+        if sample_col in df.columns:
+            valid = df[sample_col].notna().sum()
+            logger.info(f"[FEAT]   {prefix}* features merged: {valid}/{len(df)} rows have data")
+
     return df
 
 
 # ---------------------------------------------------------------------------
-# Validation
+# Step 9: Validation and cleanup
 # ---------------------------------------------------------------------------
-def _validate_and_clean(df, target="over_total"):
+
+def _validate_and_clean(df: pd.DataFrame) -> pd.DataFrame:
+    """Final NaN audit and row filtering."""
     initial = len(df)
-    target_col = TARGET_COLUMNS.get(target, target)
 
-    if target_col in df.columns:
-        df = df.dropna(subset=[target_col])
+    # Drop rows without target (can't train/evaluate)
+    df = df.dropna(subset=[TARGET_COLUMN])
     after_target = len(df)
-    logger.info(f"[FEAT]   Dropped {initial - after_target} rows with NaN target ({target_col})")
+    logger.info(f"[FEAT]   Dropped {initial - after_target} rows with NaN target")
 
+    # Feature coverage report
     available = [f for f in FEATURE_COLUMNS if f in df.columns]
     logger.info(f"[FEAT]   Feature coverage: {len(available)}/{len(FEATURE_COLUMNS)}")
     for col in available:
@@ -623,12 +899,18 @@ def _validate_and_clean(df, target="over_total"):
             logger.warning(f"[FEAT]     {col}: 0 valid values")
         elif pct < 50:
             logger.warning(f"[FEAT]     {col}: {pct:.0f}% valid ({n_valid}/{len(df)})")
+        else:
+            logger.debug(f"[FEAT]     {col}: {pct:.0f}% valid")
 
-    if "p2s_p2sz_dual_optimal" in df.columns and target_col in df.columns:
+    # L1/L2 intersection diagnostic
+    if "p2s_p2sz_dual_optimal" in df.columns:
         dual = df[df["p2s_p2sz_dual_optimal"] == 1.0]
         if len(dual) > 10:
-            rate_all = df[target_col].mean()
-            rate_dual = dual[target_col].mean()
-            logger.info(f"[FEAT]   INTERSECTION: overall={rate_all:.3f}, dual={rate_dual:.3f}, "
-                        f"lift={rate_dual - rate_all:+.3f}")
+            target_rate_overall = df[TARGET_COLUMN].mean()
+            target_rate_dual = dual[TARGET_COLUMN].mean()
+            logger.info(f"[FEAT]   INTERSECTION DIAGNOSTIC:")
+            logger.info(f"[FEAT]     Overall {TARGET_COLUMN} rate: {target_rate_overall:.3f}")
+            logger.info(f"[FEAT]     Dual optimal {TARGET_COLUMN} rate: {target_rate_dual:.3f}")
+            logger.info(f"[FEAT]     Lift: {(target_rate_dual - target_rate_overall):.3f} ({(target_rate_dual/target_rate_overall - 1)*100:+.1f}%)")
+
     return df
