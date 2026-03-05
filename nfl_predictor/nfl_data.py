@@ -424,38 +424,51 @@ def _aggregate_to_drives(pbp: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"PBP missing required columns: {missing}")
 
     logger.info(f"[DATA] Aggregating {len(pbp)} plays to drives...")
+    logger.info(f"[DATA] PBP columns available: {sorted(pbp.columns.tolist())}")
 
     # Exclude kneeldowns and spikes — not real drives
     pbp_clean = pbp[~pbp["play_type"].isin(["no_play", "qb_kneel", "qb_spike"])].copy()
 
+    # Build agg dict defensively — only include columns that exist
+    agg_dict = {
+        "season":       ("season", "first"),
+        "week":         ("week", "first"),
+        "posteam":      ("posteam", "first"),
+        "defteam":      ("defteam", "first"),
+        "drive_result": ("fixed_drive_result", "last"),
+        "drive_play_count": ("play_id", "count"),
+        "drive_yards_gained": ("yards_gained", "sum"),
+        "epa_sum":      ("epa", "sum"),
+        "epa_mean":     ("epa", "mean"),
+        "qtr_start":    ("qtr", "first"),
+    }
+
+    optional = {
+        "game_type":    ("game_type", "first"),
+        "game_date":    ("game_date", "first"),
+        "drive_inside20": ("drive_inside20", "max"),
+        "drive_ended_with_score": ("drive_ended_with_score", "max"),
+        "drive_time_of_possession": ("drive_time_of_possession", "first"),
+        "drive_first_downs": ("drive_first_downs", "first"),
+        "start_yard_line": ("yardline_100", "first"),
+        "end_yard_line": ("yardline_100", "last"),
+        "third_down_attempts": ("third_down_failed", "sum"),
+        "third_down_conversions": ("third_down_converted", "sum"),
+        "posteam_score_start": ("posteam_score", "first"),
+        "defteam_score_start": ("defteam_score", "first"),
+        "game_seconds_remaining_start": ("game_seconds_remaining", "first"),
+    }
+
+    for out_col, (src_col, func) in optional.items():
+        if src_col in pbp_clean.columns:
+            agg_dict[out_col] = (src_col, func)
+        else:
+            logger.warning(f"[DATA] Optional column '{src_col}' not in PBP — skipping")
+
     # Per-drive aggregation
     drive_agg = (
         pbp_clean.groupby(["game_id", "fixed_drive"])
-        .agg(
-            season=("season", "first"),
-            week=("week", "first"),
-            game_type=("game_type", "first"),
-            game_date=("game_date", "first") if "game_date" in pbp_clean.columns else ("season", "first"),
-            posteam=("posteam", "first"),
-            defteam=("defteam", "first"),
-            drive_result=("fixed_drive_result", "last"),
-            drive_play_count=("play_id", "count"),
-            drive_yards_gained=("yards_gained", "sum"),
-            drive_inside20=("drive_inside20", "max"),
-            drive_ended_with_score=("drive_ended_with_score", "max"),
-            drive_time_of_possession=("drive_time_of_possession", "first"),
-            drive_first_downs=("drive_first_downs", "first"),
-            start_yard_line=("yardline_100", "first"),   # yards from own goal
-            end_yard_line=("yardline_100", "last"),       # yards from own goal at drive end
-            epa_sum=("epa", "sum"),
-            epa_mean=("epa", "mean"),
-            third_down_attempts=("third_down_failed", "sum"),   # will add converted below
-            third_down_conversions=("third_down_converted", "sum"),
-            posteam_score_start=("posteam_score", "first"),
-            defteam_score_start=("defteam_score", "first"),
-            qtr_start=("qtr", "first"),
-            game_seconds_remaining_start=("game_seconds_remaining", "first"),
-        )
+        .agg(**agg_dict)
         .reset_index()
         .rename(columns={"fixed_drive": "drive_id"})
     )
