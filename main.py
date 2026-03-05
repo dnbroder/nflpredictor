@@ -128,11 +128,16 @@ async def startup_event():
     logger.info(f"[STARTUP] Features:    {len(FEATURE_COLUMNS)}")
     logger.info(f"[STARTUP] Season:      {CURRENT_SEASON}")
     logger.info("=" * 60)
-    model, features = load_model()
-    if model is not None:
-        logger.info(f"[STARTUP] Model loaded OK — {len(features)} features")
-    else:
-        logger.warning("[STARTUP] No model found. Call POST /train before predicting.")
+    try:
+        result = load_model()
+        model = result[0] if result else None
+        features = result[1] if result and len(result) > 1 else None
+        if model is not None:
+            logger.info(f"[STARTUP] Model loaded OK — {len(features) if features else '?'} features")
+        else:
+            logger.warning("[STARTUP] No model found. Call POST /train before predicting.")
+    except Exception as e:
+        logger.warning(f"[STARTUP] Model load failed (non-fatal): {e}")
     logger.info("[STARTUP] API ready")
 
 # ---------------------------------------------------------------------------
