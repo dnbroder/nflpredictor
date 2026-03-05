@@ -248,6 +248,56 @@ def train(
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
+@app.post("/train-async")
+def train_async(
+    train_start: int = Query(default=2016),
+    train_end: int = Query(default=2022),
+):
+    """Train model in background thread. Returns immediately."""
+    job_id = str(uuid.uuid4())[:8]
+
+    def _run():
+        t0 = time.time()
+        logger.info(f"[ASYNC-TRAIN {job_id}] ========================================")
+        logger.info(f"[ASYNC-TRAIN {job_id}] train_start={train_start}, train_end={train_end}")
+        try:
+            seasons = list(range(train_start, train_end + 1))
+
+            logger.info(f"[ASYNC-TRAIN {job_id}] Loading games for {seasons}...")
+            games = load_games(seasons)
+            logger.info(f"[ASYNC-TRAIN {job_id}] Games: {len(games)} rows")
+
+            logger.info(f"[ASYNC-TRAIN {job_id}] Loading drives...")
+            drives = load_drives(seasons)
+            logger.info(f"[ASYNC-TRAIN {job_id}] Drives: {len(drives)} rows")
+
+            logger.info(f"[ASYNC-TRAIN {job_id}] Engineering features...")
+            featured = engineer_features(games, drives)
+            logger.info(f"[ASYNC-TRAIN {job_id}] Features: {len(featured)} rows")
+
+            logger.info(f"[ASYNC-TRAIN {job_id}] Training model...")
+            model, metrics = train_model(featured)
+
+            elapsed = time.time() - t0
+            logger.info(f"[ASYNC-TRAIN {job_id}] ========================================")
+            logger.info(f"[ASYNC-TRAIN {job_id}] COMPLETE in {elapsed:.1f}s — "
+                        f"AUC={metrics.get('auc_roc')}, Accuracy={metrics.get('accuracy')}")
+            logger.info(f"[ASYNC-TRAIN {job_id}] ========================================")
+        except Exception as e:
+            logger.error(f"[ASYNC-TRAIN {job_id}] FAILED: {e}", exc_info=True)
+
+    thread = threading.Thread(target=_run, daemon=True, name=f"train-{job_id}")
+    thread.start()
+    logger.info(f"[ASYNC-TRAIN {job_id}] Thread started")
+    return {
+        "status": "started",
+        "job_id": job_id,
+        "train_start": train_start,
+        "train_end": train_end,
+        "message": f"Job {job_id} running. Monitor CloudWatch /ecs/nfl-predictor for progress.",
+    }
+
+
 @app.post("/backtest")
 def backtest(
     train_start: int = Query(default=2016),
