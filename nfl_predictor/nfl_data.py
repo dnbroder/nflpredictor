@@ -39,6 +39,8 @@ SCHEDULE_COLS = [
     "old_game_id",
     "spread_line",    # opening/consensus spread (home perspective, negative = home favored)
     "total_line",     # opening total
+    "closing_spread_line",  # closing spread (Pro Football Reference)
+    "closing_total_line",   # closing total (Pro Football Reference) — PRIMARY TARGET SOURCE
     "div_game",
     "roof",           # dome / open / closed / retractable
     "surface",
@@ -89,6 +91,8 @@ PBP_COLS = [
     "field_goal_result",   # made / missed / blocked
     "kick_distance",
     "two_point_attempt", "two_point_conv_result",
+    "closing_spread_line",   # closing spread (Pro Football Reference)
+    "closing_total_line",    # closing total (Pro Football Reference) — used as target
 ]
 
 
@@ -544,6 +548,18 @@ def _clean_games(df: pd.DataFrame) -> pd.DataFrame:
     # Compute result if missing
     if "result" not in df.columns and "home_score" in df.columns:
         df["result"] = df["home_score"] - df["away_score"]
+
+    # Map closing lines to standard names expected by feature engineering
+    if "closing_total_line" in df.columns:
+        df["closing_total"] = pd.to_numeric(df["closing_total_line"], errors="coerce")
+        n_valid = df["closing_total"].notna().sum()
+        logger.info(f"[DATA] closing_total: {n_valid}/{len(df)} valid values")
+    else:
+        logger.warning("[DATA] closing_total_line not in schedule data — target will be NaN")
+        df["closing_total"] = np.nan
+
+    if "closing_spread_line" in df.columns:
+        df["closing_spread"] = pd.to_numeric(df["closing_spread_line"], errors="coerce")
 
     # is_dome
     if "roof" in df.columns:
