@@ -168,15 +168,10 @@ def root():
 
 @app.get("/health")
 def health():
-    model, features = load_model()
-    model_loaded = model is not None
     return {
         "status": "ok",
         "version": VERSION,
         "environment": ENVIRONMENT,
-        "model_loaded": model_loaded,
-        "target": TARGET_COLUMN if model_loaded else None,
-        "features_count": len(features) if model_loaded else None,
         "timestamp": datetime.utcnow().isoformat(),
     }
 
