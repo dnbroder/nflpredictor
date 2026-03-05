@@ -27,6 +27,7 @@ warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
 # Target
 # ---------------------------------------------------------------------------
 TARGET_COLUMN = "over_total"  # game goes over the total line
+TARGET_COLUMNS = [TARGET_COLUMN]  # alias for model.py compatibility
 
 # ---------------------------------------------------------------------------
 # Feature registry
