@@ -26,7 +26,7 @@ logger = get_logger(__name__)
 logger.info("[BOOT] Importing nfl_predictor modules...")
 
 try:
-    from nfl_predictor.nfl_data import load_games, load_drives, load_players, load_injuries, CURRENT_SEASON
+    from nfl_predictor.nfl_data import load_games, load_drives, CURRENT_SEASON
     logger.info("[BOOT] nfl_data OK")
 except Exception as e:
     logger.critical(f"[BOOT] FAILED to import nfl_data: {e}", exc_info=True)
