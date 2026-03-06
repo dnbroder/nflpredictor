@@ -26,7 +26,10 @@ logger = get_logger(__name__)
 logger.info("[BOOT] Importing nfl_predictor modules...")
 
 try:
-    from nfl_predictor.nfl_data import load_games, load_drives, CURRENT_SEASON
+    from nfl_predictor.nfl_data import (
+        load_games, load_drives, load_closing_lines,
+        load_epa_by_game, load_qb_stats, CURRENT_SEASON,
+    )
     logger.info("[BOOT] nfl_data OK")
 except Exception as e:
     logger.critical(f"[BOOT] FAILED to import nfl_data: {e}", exc_info=True)
@@ -266,8 +269,20 @@ def train_async(
             drives = load_drives(seasons)
             logger.info(f"[ASYNC-TRAIN {job_id}] Drives: {len(drives)} rows")
 
+            logger.info(f"[ASYNC-TRAIN {job_id}] Loading closing lines...")
+            closing_lines = load_closing_lines(seasons)
+            logger.info(f"[ASYNC-TRAIN {job_id}] Closing lines: {len(closing_lines)} games")
+
+            logger.info(f"[ASYNC-TRAIN {job_id}] Loading EPA by game...")
+            epa = load_epa_by_game(seasons)
+            logger.info(f"[ASYNC-TRAIN {job_id}] EPA: {len(epa)} team-game rows")
+
+            logger.info(f"[ASYNC-TRAIN {job_id}] Loading QB stats...")
+            qb = load_qb_stats(seasons)
+            logger.info(f"[ASYNC-TRAIN {job_id}] QB stats: {len(qb)} team-game rows")
+
             logger.info(f"[ASYNC-TRAIN {job_id}] Engineering features...")
-            featured = engineer_features(games, drives)
+            featured = engineer_features(games, drives, closing_lines_df=closing_lines, epa_df=epa, qb_df=qb)
             logger.info(f"[ASYNC-TRAIN {job_id}] Features: {len(featured)} rows")
 
             logger.info(f"[ASYNC-TRAIN {job_id}] Training model...")

@@ -128,6 +128,8 @@ def engineer_features(
     players_df: pd.DataFrame = None,
     contracts_df: pd.DataFrame = None,
     closing_lines_df: pd.DataFrame = None,
+    epa_df: pd.DataFrame = None,
+    qb_df: pd.DataFrame = None,
 ) -> pd.DataFrame:
     """
     Build all features from raw NFL data.
@@ -174,13 +176,23 @@ def engineer_features(
     logger.info("[FEAT] Step 5: Engineering intersection features...")
     df = _build_intersection_features(df)
 
-    # Step 6: Layer 3 (stub — Phase 3)
-    for col in [c for c in FEATURE_COLUMNS if c.startswith("pic_")]:
-        df[col] = np.nan
+    # Step 6: EPA features
+    logger.info("[FEAT] Step 6: Merging EPA features...")
+    df = _build_epa_features(df, epa_df)
 
-    # Step 7: Layer 4 (stub — Phase 4)
+    # Step 7: QB features
+    logger.info("[FEAT] Step 7: Merging QB features...")
+    df = _build_qb_features(df, qb_df)
+
+    # Step 6b: Layer 3 (stub — Phase 3)
+    for col in [c for c in FEATURE_COLUMNS if c.startswith("pic_")]:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    # Step 7b: Layer 4 (stub — Phase 4)
     for col in [c for c in FEATURE_COLUMNS if c.startswith("pim_")]:
-        df[col] = np.nan
+        if col not in df.columns:
+            df[col] = np.nan
 
     # Step 8: Standard / contextual features
     logger.info("[FEAT] Step 8: Building standard features...")
@@ -778,6 +790,62 @@ def _build_intersection_features(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Step 8: Standard contextual features
 # ---------------------------------------------------------------------------
+
+def _build_epa_features(df: pd.DataFrame, epa_df: pd.DataFrame = None) -> pd.DataFrame:
+    """Merge pre-game rolling EPA into game-team rows."""
+    if epa_df is None or epa_df.empty:
+        logger.warning("[FEAT] EPA data not provided — epa_offense_avg and epa_defense_avg will be NaN")
+        df["epa_offense_avg"] = np.nan
+        df["epa_defense_avg"] = np.nan
+        return df
+
+    epa_cols = [c for c in ["game_id", "team", "epa_off_5g", "epa_def_5g", "epa_off_season", "epa_def_season"]
+                if c in epa_df.columns]
+    epa = epa_df[epa_cols].copy()
+
+    df = df.merge(epa, on=["game_id", "team"], how="left")
+
+    # Use 5g rolling as primary, fall back to season avg
+    df["epa_offense_avg"] = df["epa_off_5g"].fillna(df.get("epa_off_season", np.nan))
+    df["epa_defense_avg"] = df["epa_def_5g"].fillna(df.get("epa_def_season", np.nan))
+
+    n_off = df["epa_offense_avg"].notna().sum()
+    n_def = df["epa_defense_avg"].notna().sum()
+    logger.info(f"[FEAT]   EPA merged: offense {n_off}/{len(df)} valid, defense {n_def}/{len(df)} valid")
+
+    return df
+
+
+def _build_qb_features(df: pd.DataFrame, qb_df: pd.DataFrame = None) -> pd.DataFrame:
+    """Merge pre-game QB efficiency features into game-team rows."""
+    if qb_df is None or qb_df.empty:
+        logger.warning("[FEAT] QB data not provided — QB features will be NaN")
+        for col in ["pic_composite_l1", "pic_key_player_active", "pic_ol_composite", "pic_pass_rush_opp"]:
+            if col not in df.columns:
+                df[col] = np.nan
+        return df
+
+    qb_cols = [c for c in ["game_id", "team", "qb_epa_5g", "qb_epa_season",
+                            "qb_completion_pct", "qb_air_yards", "is_backup_qb"]
+               if c in qb_df.columns]
+    qb = qb_df[qb_cols].copy()
+
+    df = df.merge(qb, on=["game_id", "team"], how="left")
+
+    if "qb_epa_5g" in df.columns:
+        df["pic_composite_l1"] = df["qb_epa_5g"]
+    if "is_backup_qb" in df.columns:
+        df["pic_key_player_active"] = 1 - df["is_backup_qb"].fillna(0)
+    if "qb_completion_pct" in df.columns:
+        df["pic_ol_composite"] = df["qb_completion_pct"]
+    if "qb_air_yards" in df.columns:
+        df["pic_pass_rush_opp"] = df["qb_air_yards"]
+
+    n_valid = df["pic_composite_l1"].notna().sum() if "pic_composite_l1" in df.columns else 0
+    logger.info(f"[FEAT]   QB features merged: {n_valid}/{len(df)} valid")
+
+    return df
+
 
 def _build_standard_features(df: pd.DataFrame, games_df: pd.DataFrame) -> pd.DataFrame:
     """Build EPA rolling averages, scoring averages, rest, weather."""

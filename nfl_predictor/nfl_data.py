@@ -366,6 +366,359 @@ def load_contracts(source: str = "local") -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def load_closing_lines(
+    seasons: List[int] = None,
+    cache: bool = True,
+) -> pd.DataFrame:
+    """
+    Load closing total and spread lines from The Odds API.
+    Free tier: 500 requests/month — we cache aggressively to S3.
+
+    Returns DataFrame with columns:
+        game_id, season, week, home_team, away_team,
+        closing_total, closing_spread
+    """
+    seasons = seasons or list(range(2020, CURRENT_SEASON + 1))
+    cache_key = f"data/odds/closing_lines_{min(seasons)}_{max(seasons)}.parquet"
+    t0 = time.time()
+
+    api_key = os.environ.get("ODDS_API_KEY", "")
+
+    logger.info(f"[DATA] load_closing_lines: seasons={seasons}, cache={cache}")
+
+    if cache:
+        cached = _load_from_s3(cache_key)
+        if cached is not None:
+            logger.info(f"[DATA] Closing lines S3 cache HIT: {len(cached)} games in {time.time()-t0:.1f}s")
+            return cached
+
+    if not api_key:
+        logger.warning("[DATA] ODDS_API_KEY not set — closing lines unavailable")
+        return pd.DataFrame()
+
+    try:
+        import requests
+        import nfl_data_py as nfl
+
+        # Load schedule to get game_id → date/team mapping
+        schedule = nfl.import_schedules(seasons)
+        schedule = schedule[schedule["home_score"].notna()].copy()  # completed games only
+
+        all_lines = []
+        sport = "americanfootball_nfl"
+        regions = "us"
+        markets = "totals,spreads"
+
+        for season in seasons:
+            season_games = schedule[schedule["season"] == season].copy()
+            # Get all historical events for this season
+            # The Odds API historical endpoint: /v4/sports/{sport}/odds-history
+            # We fetch by date range
+            dates = season_games["gameday"].dropna().unique()
+            logger.info(f"[DATA] Fetching closing lines for {season}: {len(season_games)} games across {len(dates)} dates")
+
+            for gameday in sorted(dates):
+                date_str = pd.Timestamp(gameday).strftime("%Y-%m-%dT23:59:00Z")
+                url = f"https://api.the-odds-api.com/v4/sports/{sport}/odds-history/"
+                params = {
+                    "apiKey": api_key,
+                    "regions": regions,
+                    "markets": markets,
+                    "date": date_str,
+                    "oddsFormat": "american",
+                }
+                try:
+                    resp = requests.get(url, params=params, timeout=15)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        for event in data.get("data", []):
+                            home = event.get("home_team", "")
+                            away = event.get("away_team", "")
+                            closing_total = None
+                            closing_spread = None
+                            for bm in event.get("bookmakers", []):
+                                for market in bm.get("markets", []):
+                                    if market["key"] == "totals" and closing_total is None:
+                                        for outcome in market.get("outcomes", []):
+                                            if outcome["name"] == "Over":
+                                                closing_total = outcome.get("point")
+                                                break
+                                    if market["key"] == "spreads" and closing_spread is None:
+                                        for outcome in market.get("outcomes", []):
+                                            if outcome["name"] == home:
+                                                closing_spread = outcome.get("point")
+                                                break
+                                if closing_total and closing_spread:
+                                    break
+
+                            if closing_total is not None:
+                                # Match to schedule game_id
+                                mask = (
+                                    (season_games["gameday"] == gameday) &
+                                    (season_games["home_team"].str.contains(home[-3:] if len(home) > 3 else home, case=False, na=False) |
+                                     season_games["away_team"].str.contains(away[-3:] if len(away) > 3 else away, case=False, na=False))
+                                )
+                                matched = season_games[mask]
+                                if len(matched) > 0:
+                                    row = matched.iloc[0]
+                                    all_lines.append({
+                                        "game_id": row["game_id"],
+                                        "season": season,
+                                        "week": row.get("week"),
+                                        "home_team": row["home_team"],
+                                        "away_team": row["away_team"],
+                                        "closing_total": closing_total,
+                                        "closing_spread": closing_spread,
+                                    })
+                    elif resp.status_code == 422:
+                        logger.debug(f"[DATA] No odds data for {date_str}")
+                    else:
+                        logger.warning(f"[DATA] Odds API {resp.status_code} for {date_str}: {resp.text[:100]}")
+                except Exception as e:
+                    logger.warning(f"[DATA] Odds API request failed for {date_str}: {e}")
+
+        if not all_lines:
+            logger.warning("[DATA] No closing lines fetched from Odds API")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(all_lines)
+        df["closing_total"] = pd.to_numeric(df["closing_total"], errors="coerce")
+        df["closing_spread"] = pd.to_numeric(df["closing_spread"], errors="coerce")
+        n_valid = df["closing_total"].notna().sum()
+        logger.info(f"[DATA] Closing lines fetched: {len(df)} games, {n_valid} with valid totals in {time.time()-t0:.1f}s")
+
+        if cache and len(df) > 0:
+            _save_to_s3(df, cache_key)
+
+        return df
+
+    except ImportError as e:
+        logger.error(f"[DATA] Missing dependency for closing lines: {e}")
+        return pd.DataFrame()
+    except Exception as e:
+        logger.error(f"[DATA] load_closing_lines failed: {e}", exc_info=True)
+        return pd.DataFrame()
+
+
+def load_epa_by_game(
+    seasons: List[int] = None,
+    cache: bool = True,
+) -> pd.DataFrame:
+    """
+    Aggregate EPA from PBP to team-game level.
+    Returns rolling offensive and defensive EPA/play per team per game.
+
+    Columns: game_id, season, week, team,
+             epa_off_per_play,   # offensive EPA/play this game
+             epa_def_per_play,   # defensive EPA/play allowed this game
+             epa_off_5g,         # rolling 5-game offensive EPA/play
+             epa_def_5g,         # rolling 5-game defensive EPA/play
+    """
+    seasons = seasons or list(range(2016, CURRENT_SEASON + 1))
+    cache_key = f"data/epa/epa_by_game_{min(seasons)}_{max(seasons)}.parquet"
+    t0 = time.time()
+
+    logger.info(f"[DATA] load_epa_by_game: seasons={seasons}")
+
+    if cache:
+        cached = _load_from_s3(cache_key)
+        if cached is not None:
+            logger.info(f"[DATA] EPA S3 cache HIT: {len(cached)} team-game rows in {time.time()-t0:.1f}s")
+            return cached
+
+    try:
+        pbp = load_plays(seasons, cache=True)
+
+        # Keep only real plays with valid EPA
+        plays = pbp[
+            pbp["play_type"].isin(["pass", "run"]) &
+            pbp["epa"].notna() &
+            pbp["posteam"].notna()
+        ].copy()
+
+        logger.info(f"[DATA] EPA: {len(plays)} pass/run plays from {len(pbp)} total")
+
+        # Offensive EPA per play per team per game
+        off_epa = (
+            plays.groupby(["game_id", "season", "week", "posteam"])
+            .agg(
+                epa_off_per_play=("epa", "mean"),
+                epa_off_sum=("epa", "sum"),
+                off_plays=("epa", "count"),
+            )
+            .reset_index()
+            .rename(columns={"posteam": "team"})
+        )
+
+        # Defensive EPA per play allowed per team per game
+        def_epa = (
+            plays.groupby(["game_id", "season", "week", "defteam"])
+            .agg(
+                epa_def_per_play=("epa", "mean"),
+            )
+            .reset_index()
+            .rename(columns={"defteam": "team"})
+        )
+
+        # Merge off and def
+        epa = off_epa.merge(def_epa, on=["game_id", "season", "week", "team"], how="outer")
+
+        # Sort for rolling calcs
+        epa = epa.sort_values(["team", "season", "week"]).reset_index(drop=True)
+
+        # Rolling 5-game EPA (lagged — pre-game state)
+        epa["epa_off_5g"] = epa.groupby("team")["epa_off_per_play"].transform(
+            lambda x: x.shift(1).rolling(window=5, min_periods=2).mean()
+        )
+        epa["epa_def_5g"] = epa.groupby("team")["epa_def_per_play"].transform(
+            lambda x: x.shift(1).rolling(window=5, min_periods=2).mean()
+        )
+        epa["epa_off_season"] = epa.groupby(["team", "season"])["epa_off_per_play"].transform(
+            lambda x: x.shift(1).expanding(min_periods=3).mean()
+        )
+        epa["epa_def_season"] = epa.groupby(["team", "season"])["epa_def_per_play"].transform(
+            lambda x: x.shift(1).expanding(min_periods=3).mean()
+        )
+
+        n_valid = epa["epa_off_5g"].notna().sum()
+        logger.info(f"[DATA] EPA by game: {len(epa)} team-game rows, {n_valid} with rolling EPA in {time.time()-t0:.1f}s")
+
+        if cache:
+            _save_to_s3(epa, cache_key)
+
+        return epa
+
+    except Exception as e:
+        logger.error(f"[DATA] load_epa_by_game failed: {e}", exc_info=True)
+        return pd.DataFrame()
+
+
+def load_qb_stats(
+    seasons: List[int] = None,
+    cache: bool = True,
+) -> pd.DataFrame:
+    """
+    Load QB efficiency stats per game with rolling averages.
+    Used to detect backup starters and QB efficiency signals.
+
+    Columns: game_id, season, week, team,
+             qb_epa_per_play,        # QB EPA/dropback this game
+             qb_completion_pct,      # completion % this game
+             qb_air_yards_per_att,   # air yards per attempt
+             qb_epa_5g,              # rolling 5-game QB EPA/play
+             is_backup_qb,           # 1 if starter EPA significantly below team avg
+             qb_id,                  # starter player ID
+    """
+    seasons = seasons or list(range(2016, CURRENT_SEASON + 1))
+    cache_key = f"data/qb/qb_stats_{min(seasons)}_{max(seasons)}.parquet"
+    t0 = time.time()
+
+    logger.info(f"[DATA] load_qb_stats: seasons={seasons}")
+
+    if cache:
+        cached = _load_from_s3(cache_key)
+        if cached is not None:
+            logger.info(f"[DATA] QB stats S3 cache HIT: {len(cached)} rows in {time.time()-t0:.1f}s")
+            return cached
+
+    try:
+        import nfl_data_py as nfl
+
+        # Weekly player stats — includes QB passing stats
+        logger.info(f"[DATA] Fetching weekly QB stats for {seasons}...")
+        weekly = nfl.import_weekly_data(seasons, ["passing"])
+        logger.info(f"[DATA] Weekly data: {len(weekly)} rows")
+
+        # Filter to QBs with meaningful dropbacks
+        qb_cols = [c for c in [
+            "player_id", "player_name", "recent_team", "season", "week",
+            "completions", "attempts", "passing_yards", "passing_tds",
+            "interceptions", "sacks", "passing_epa", "dakota",
+            "air_yards_per_attempt",
+        ] if c in weekly.columns]
+
+        qbs = weekly[weekly["attempts"] >= 5][qb_cols].copy() if "attempts" in weekly.columns else weekly[qb_cols].copy()
+
+        # Rename for clarity
+        rename = {
+            "recent_team": "team",
+            "passing_epa": "qb_epa_sum",
+            "air_yards_per_attempt": "qb_air_yards",
+        }
+        qbs = qbs.rename(columns={k: v for k, v in rename.items() if k in qbs.columns})
+
+        # EPA per attempt
+        if "qb_epa_sum" in qbs.columns and "attempts" in qbs.columns:
+            qbs["qb_epa_per_play"] = qbs["qb_epa_sum"] / qbs["attempts"].replace(0, np.nan)
+
+        # Completion pct
+        if "completions" in qbs.columns and "attempts" in qbs.columns:
+            qbs["qb_completion_pct"] = qbs["completions"] / qbs["attempts"].replace(0, np.nan)
+
+        # Sort and compute rolling EPA
+        qbs = qbs.sort_values(["player_id", "season", "week"]).reset_index(drop=True)
+        if "qb_epa_per_play" in qbs.columns:
+            qbs["qb_epa_5g"] = qbs.groupby("player_id")["qb_epa_per_play"].transform(
+                lambda x: x.shift(1).rolling(window=5, min_periods=2).mean()
+            )
+            qbs["qb_epa_season"] = qbs.groupby(["player_id", "season"])["qb_epa_per_play"].transform(
+                lambda x: x.shift(1).expanding(min_periods=3).mean()
+            )
+
+        # Get team starter per game (highest attempts)
+        if "attempts" in qbs.columns:
+            team_starter = (
+                qbs.sort_values("attempts", ascending=False)
+                .drop_duplicates(subset=["team", "season", "week"])
+            )
+        else:
+            team_starter = qbs.drop_duplicates(subset=["team", "season", "week"])
+
+        # Flag potential backups: rolling EPA significantly below team season avg
+        if "qb_epa_5g" in team_starter.columns and "qb_epa_season" in team_starter.columns:
+            team_starter["is_backup_qb"] = (
+                (team_starter["qb_epa_5g"] < team_starter["qb_epa_season"] - 0.15)
+            ).astype(int)
+        else:
+            team_starter["is_backup_qb"] = 0
+
+        # Merge with schedule to get game_id
+        schedule = nfl.import_schedules(seasons)[["game_id", "season", "week", "home_team", "away_team"]].copy()
+
+        # Join for home team
+        home = team_starter.merge(
+            schedule.rename(columns={"home_team": "team"})[["game_id", "season", "week", "team"]],
+            on=["season", "week", "team"], how="left"
+        )
+        away = team_starter.merge(
+            schedule.rename(columns={"away_team": "team"})[["game_id", "season", "week", "team"]],
+            on=["season", "week", "team"], how="left"
+        )
+        team_starter = pd.concat([home, away]).drop_duplicates(subset=["team", "season", "week"])
+        team_starter = team_starter[team_starter["game_id"].notna()].copy()
+
+        keep_cols = [c for c in [
+            "game_id", "season", "week", "team", "player_id",
+            "qb_epa_per_play", "qb_completion_pct", "qb_air_yards",
+            "qb_epa_5g", "qb_epa_season", "is_backup_qb",
+        ] if c in team_starter.columns]
+
+        result = team_starter[keep_cols].copy()
+        result = result.rename(columns={"player_id": "qb_id"})
+
+        n_valid = result["qb_epa_5g"].notna().sum() if "qb_epa_5g" in result.columns else 0
+        logger.info(f"[DATA] QB stats: {len(result)} team-game rows, {n_valid} with rolling EPA in {time.time()-t0:.1f}s")
+
+        if cache:
+            _save_to_s3(result, cache_key)
+
+        return result
+
+    except Exception as e:
+        logger.error(f"[DATA] load_qb_stats failed: {e}", exc_info=True)
+        return pd.DataFrame()
+
+
 def load_lines_historical(source: str = "local") -> pd.DataFrame:
     """
     Load historical closing lines for backtest validation.
