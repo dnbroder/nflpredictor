@@ -1,330 +1,370 @@
 """
-NFL Model -- XGBoost training, hyperparameter tuning, save/load.
-
-FIXES vs original:
-  - Import TARGET_COLUMNS (dict) instead of nonexistent symbol
-  - Fixed feature_importance bug: 'sorted_imp' checked via local var not dir()
-  - Added NaN target filtering before train/test split
+NFL Model — XGBoost training, hyperparameter tuning, save/load.
+Mirrors GolfPredictor model.py exactly.
 """
 
-import logging
+from nfl_predictor.logger import get_logger
 import os
 import pickle
-import time
-from datetime import datetime
-
 import boto3
 import numpy as np
 import pandas as pd
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import (
-    accuracy_score, classification_report,
-    log_loss, roc_auc_score, brier_score_loss,
-)
-from sklearn.model_selection import (
-    StratifiedKFold, cross_val_score, train_test_split
-)
+from datetime import datetime
+
 from xgboost import XGBClassifier
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    log_loss,
+    roc_auc_score,
+)
 
-from nfl_predictor.feature_engineering import FEATURE_COLUMNS, TARGET_COLUMNS
+from nfl_predictor.feature_engineering import FEATURE_COLUMNS, TARGET_COLUMN
 
-logger = logging.getLogger("nflpredictor")
+logger = get_logger(__name__)
 
-MODEL_FILENAME = "nfl_predictor.pkl"
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+MODEL_FILENAME = "nfl_scoring_predictor.pkl"
 LOCAL_MODEL_PATH = f"/tmp/{MODEL_FILENAME}"
-S3_BUCKET = os.environ.get("S3_BUCKET", "nfl-predictor-bucket")
 S3_MODEL_KEY = f"models/{MODEL_FILENAME}"
 
+# Default hyperparameters (baseline)
 DEFAULT_PARAMS = {
-    "n_estimators": 400, "max_depth": 5, "learning_rate": 0.04,
-    "subsample": 0.8, "colsample_bytree": 0.75, "min_child_weight": 7,
-    "reg_alpha": 0.1, "reg_lambda": 1.5, "scale_pos_weight": 1.0,
+    "n_estimators": 300,
+    "max_depth": 5,
+    "learning_rate": 0.05,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "min_child_weight": 5,
+    "reg_alpha": 0.1,
+    "reg_lambda": 1.0,
 }
 
+# Hyperparameter search space
 PARAM_GRID = {
-    "n_estimators": [200, 300, 400, 600, 800, 1000],
-    "max_depth": [3, 4, 5, 6, 7],
-    "learning_rate": [0.01, 0.02, 0.03, 0.04, 0.05, 0.08, 0.1],
+    "n_estimators": [200, 300, 500, 700, 1000],
+    "max_depth": [3, 4, 5, 6, 7, 8],
+    "learning_rate": [0.01, 0.02, 0.03, 0.05, 0.08, 0.1],
     "subsample": [0.6, 0.7, 0.8, 0.9, 1.0],
-    "colsample_bytree": [0.6, 0.7, 0.75, 0.8, 0.9, 1.0],
-    "min_child_weight": [3, 5, 7, 10, 15],
-    "reg_alpha": [0, 0.01, 0.05, 0.1, 0.5, 1.0],
-    "reg_lambda": [0.5, 1.0, 1.5, 2.0, 5.0],
+    "colsample_bytree": [0.6, 0.7, 0.8, 0.9, 1.0],
+    "min_child_weight": [1, 3, 5, 7, 10],
+    "reg_alpha": [0, 0.01, 0.1, 0.5, 1.0],
+    "reg_lambda": [0.5, 1.0, 2.0, 5.0],
 }
 
 
-def train_model(featured_data, target="over_total", test_size=0.2,
-                random_state=42, params=None, calibrate=True):
+# ---------------------------------------------------------------------------
+# Train
+# ---------------------------------------------------------------------------
+def train_model(
+    featured_data: pd.DataFrame,
+    test_size: float = 0.2,
+    random_state: int = 42,
+    params: dict = None,
+) -> tuple:
+    """
+    Train XGBoost classifier on featured data.
+
+    Args:
+        featured_data: DataFrame with feature columns and target
+        test_size: Fraction held out for validation
+        random_state: Random seed
+        params: Optional hyperparameters (uses DEFAULT_PARAMS if None)
+
+    Returns:
+        (model, metrics_dict) or (None, error_dict)
+    """
     logger.info("[MODEL] ============================================================")
-    logger.info(f"[MODEL] TRAINING XGBoost -- target={target}, rows={len(featured_data)}")
+    logger.info(f"[MODEL] TRAINING XGBoost on {len(featured_data)} rows")
     logger.info("[MODEL] ============================================================")
 
-    target_col = TARGET_COLUMNS[target]
     hp = params or DEFAULT_PARAMS
 
-    available = [f for f in FEATURE_COLUMNS if f in featured_data.columns]
-    missing = [f for f in FEATURE_COLUMNS if f not in featured_data.columns]
-    if missing:
-        logger.warning(f"[MODEL] Missing {len(missing)} features: {missing[:5]}...")
+    # Select available features
+    available_features = [f for f in FEATURE_COLUMNS if f in featured_data.columns]
+    missing_features = [f for f in FEATURE_COLUMNS if f not in featured_data.columns]
 
-    logger.info(f"[MODEL] Using {len(available)} features")
+    if missing_features:
+        logger.warning(f"[MODEL] Missing features (will skip): {missing_features}")
+
+    logger.info(f"[MODEL] Using {len(available_features)} features: {available_features}")
     logger.info(f"[MODEL] Hyperparameters: {hp}")
 
-    X = featured_data[available].copy()
-    y = featured_data[target_col].copy()
+    X = featured_data[available_features].copy()
+    y = featured_data[TARGET_COLUMN].copy()
 
-    # Drop NaN targets
-    valid_mask = y.notna()
-    X = X[valid_mask]
-    y = y[valid_mask]
-
-    # NaN audit
+    # Pre-training NaN audit
     nan_counts = X.isnull().sum()
     cols_with_nans = nan_counts[nan_counts > 0]
     if len(cols_with_nans) > 0:
-        logger.info(f"[MODEL] NaN audit -- {len(cols_with_nans)} cols with NaN:")
-        for col, cnt in cols_with_nans.head(10).items():
-            logger.info(f"[MODEL]   {col}: {cnt} ({cnt/len(X)*100:.1f}%)")
+        logger.warning(f"[MODEL] Pre-train NaN audit ({len(cols_with_nans)} features have NaN):")
+        for col, count in cols_with_nans.items():
+            logger.warning(f"[MODEL]   {col}: {count} NaN ({count/len(X)*100:.1f}%)")
+    else:
+        logger.info("[MODEL] Pre-train NaN audit: all features clean")
 
-    # Correlations
-    logger.info("[MODEL] Feature-target correlations (top 15):")
+    # Feature correlation with target (quick diagnostic)
+    logger.info("[MODEL] Feature-target correlations (top 10):")
     correlations = {}
-    for col in available:
-        mask = X[col].notna() & y.notna()
-        if mask.sum() > 100:
-            correlations[col] = X.loc[mask, col].corr(y[mask])
+    for col in available_features:
+        valid_mask = X[col].notna() & y.notna()
+        if valid_mask.sum() > 100:
+            correlations[col] = X.loc[valid_mask, col].corr(y[valid_mask])
     sorted_corrs = sorted(correlations.items(), key=lambda x: abs(x[1]), reverse=True)
-    for feat, corr in sorted_corrs[:15]:
+    for feat, corr in sorted_corrs[:10]:
         logger.info(f"[MODEL]   {feat}: {corr:+.4f}")
 
     logger.info(f"[MODEL] Target distribution: {y.value_counts().to_dict()}")
-    logger.info(f"[MODEL] Target positive rate: {y.mean():.3f}")
+    logger.info(f"[MODEL] Target balance: {y.mean():.3f} positive rate")
 
-    # Split: 60/20/20
-    X_trainval, X_test, y_trainval, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=random_state, stratify=y)
-    X_train, X_cal, y_train, y_cal = train_test_split(
-        X_trainval, y_trainval, test_size=0.25, random_state=random_state, stratify=y_trainval)
-    logger.info(f"[MODEL] Split: train={len(X_train)}, cal={len(X_cal)}, test={len(X_test)}")
+    # Train/test split
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=test_size, random_state=random_state, stratify=y,
+    )
+    logger.info(f"[MODEL] Train: {len(X_train)} rows, Test: {len(X_test)} rows")
 
-    # Train
-    t_start = time.time()
-    logger.info("[MODEL] Training XGBoost...")
-    xgb = XGBClassifier(
-        n_estimators=hp.get("n_estimators", 400),
+    # Train XGBoost
+    import time as _time
+    train_start = _time.time()
+    logger.info("[MODEL] Training XGBoost classifier...")
+    logger.info(f"[MODEL]   n_estimators={hp.get('n_estimators')}, max_depth={hp.get('max_depth')}, "
+                f"lr={hp.get('learning_rate')}, subsample={hp.get('subsample')}")
+    xgb_model = XGBClassifier(
+        n_estimators=hp.get("n_estimators", 300),
         max_depth=hp.get("max_depth", 5),
-        learning_rate=hp.get("learning_rate", 0.04),
+        learning_rate=hp.get("learning_rate", 0.05),
         subsample=hp.get("subsample", 0.8),
-        colsample_bytree=hp.get("colsample_bytree", 0.75),
-        min_child_weight=hp.get("min_child_weight", 7),
+        colsample_bytree=hp.get("colsample_bytree", 0.8),
+        min_child_weight=hp.get("min_child_weight", 5),
         reg_alpha=hp.get("reg_alpha", 0.1),
-        reg_lambda=hp.get("reg_lambda", 1.5),
-        scale_pos_weight=hp.get("scale_pos_weight", 1.0),
+        reg_lambda=hp.get("reg_lambda", 1.0),
         random_state=random_state,
         eval_metric="logloss",
         early_stopping_rounds=30,
     )
-    xgb.fit(X_train, y_train, eval_set=[(X_cal, y_cal)], verbose=False)
-    t_train = time.time() - t_start
-    logger.info(f"[MODEL] Training done in {t_train:.2f}s, "
-                f"best_iteration={getattr(xgb, 'best_iteration', 'N/A')}")
 
-    # Calibration
-    final_model = xgb
-    if calibrate:
-        logger.info("[MODEL] Applying Platt scaling...")
-        calibrated = CalibratedClassifierCV(xgb, cv="prefit", method="sigmoid")
-        calibrated.fit(X_cal, y_cal)
-        final_model = calibrated
-        logger.info("[MODEL] Platt scaling applied")
+    xgb_model.fit(
+        X_train, y_train,
+        eval_set=[(X_test, y_test)],
+        verbose=False,
+    )
+
+    train_elapsed = _time.time() - train_start
+    logger.info(f"[MODEL] Training completed in {train_elapsed:.2f}s")
+
+    # Early stopping info
+    best_iteration = getattr(xgb_model, "best_iteration", None)
+    best_score = getattr(xgb_model, "best_score", None)
+    if best_iteration is not None:
+        logger.info(f"[MODEL] Early stopping: best iteration = {best_iteration}/{hp.get('n_estimators', 300)}")
+        logger.info(f"[MODEL] Early stopping: best logloss = {best_score:.6f}")
+    else:
+        logger.info(f"[MODEL] No early stopping triggered — used all {hp.get('n_estimators', 300)} estimators")
 
     # Evaluate
-    y_pred = final_model.predict(X_test)
-    y_proba = final_model.predict_proba(X_test)[:, 1]
+    logger.info("[MODEL] Evaluating model...")
+    y_pred = xgb_model.predict(X_test)
+    y_proba = xgb_model.predict_proba(X_test)[:, 1]
 
     accuracy = accuracy_score(y_test, y_pred)
     auc = roc_auc_score(y_test, y_proba)
-    ll = log_loss(y_test, y_proba)
-    brier = brier_score_loss(y_test, y_proba)
+    logloss = log_loss(y_test, y_proba)
 
-    logger.info("[MODEL] ---- Test Set Results ----")
-    logger.info(f"[MODEL]   Accuracy:    {accuracy:.4f}  (break-even: 0.5238)")
-    logger.info(f"[MODEL]   AUC-ROC:     {auc:.4f}")
-    logger.info(f"[MODEL]   Log Loss:    {ll:.4f}")
-    logger.info(f"[MODEL]   Brier Score: {brier:.4f}")
+    logger.info(f"[MODEL] Results:")
+    logger.info(f"[MODEL]   Accuracy: {accuracy:.4f}")
+    logger.info(f"[MODEL]   AUC-ROC:  {auc:.4f}")
+    logger.info(f"[MODEL]   Log Loss: {logloss:.4f}")
 
     report = classification_report(y_test, y_pred)
     for line in report.split("\n"):
         if line.strip():
             logger.info(f"[MODEL]   {line}")
 
-    # Feature importance (from base xgb, not calibrated wrapper)
-    sorted_imp = None
-    if hasattr(xgb, "feature_importances_"):
-        importance = dict(zip(available, xgb.feature_importances_))
-        sorted_imp = sorted(importance.items(), key=lambda x: x[1], reverse=True)
-        logger.info("[MODEL] Feature Importance (top 20):")
-        for rank, (feat, imp) in enumerate(sorted_imp[:20], 1):
-            logger.info(f"[MODEL]   #{rank:2d} {feat}: {imp:.4f}")
+    # Feature importance
+    importance = dict(zip(available_features, xgb_model.feature_importances_))
+    sorted_importance = sorted(importance.items(), key=lambda x: x[1], reverse=True)
+    logger.info("[MODEL] Feature Importance (ALL features, ranked):")
+    for rank, (feat, imp) in enumerate(sorted_importance, 1):
+        logger.info(f"[MODEL]   #{rank} {feat}: {imp:.4f}")
 
-    # Confidence tiers
+    # Prediction probability distribution
+    logger.info("[MODEL] Prediction probability distribution:")
+    for threshold in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
+        count = (y_proba >= threshold).sum()
+        logger.info(f"[MODEL]   P >= {threshold}: {count} predictions ({count/len(y_proba)*100:.1f}%)")
+
+    # Per-confidence-tier accuracy on test set
     confidences = np.maximum(y_proba, 1 - y_proba)
     correct = (y_pred == y_test.values).astype(int)
     logger.info("[MODEL] Confidence tier accuracy (test set):")
-    for tier_label, tier_thresh in [("55+", 0.55), ("57+", 0.57), ("60+", 0.60), ("65+", 0.65)]:
+    for tier_label, tier_thresh in [("55+", 0.55), ("60+", 0.60), ("65+", 0.65), ("70+", 0.70), ("75+", 0.75)]:
         mask = confidences >= tier_thresh
-        if mask.sum() >= 10:
+        if mask.sum() > 0:
             tier_acc = correct[mask].mean()
-            status = "BEAT" if tier_acc > 0.5238 else "below"
-            logger.info(f"[MODEL]   P>={tier_label}: {correct[mask].sum()}/{mask.sum()} "
-                        f"({tier_acc*100:.1f}%) -- {status} break-even")
+            logger.info(f"[MODEL]   {tier_label}: {correct[mask].sum()}/{mask.sum()} ({tier_acc*100:.1f}%)")
         else:
-            logger.info(f"[MODEL]   P>={tier_label}: <10 samples")
+            logger.info(f"[MODEL]   {tier_label}: 0 predictions at this confidence")
 
-    # Prob distribution
-    logger.info("[MODEL] Prediction probability distribution (test set):")
-    for thresh in [0.45, 0.50, 0.52, 0.55, 0.60, 0.65, 0.70]:
-        count_over = (y_proba >= thresh).sum()
-        logger.info(f"[MODEL]   P >= {thresh}: {count_over}/{len(y_proba)} "
-                    f"({count_over/len(y_proba)*100:.1f}%)")
+    # L1/L2 intersection diagnostic
+    if "p2s_p2sz_dual_optimal" in X_test.columns:
+        dual_mask = X_test["p2s_p2sz_dual_optimal"] == 1.0
+        if dual_mask.sum() > 5:
+            acc_dual = correct[dual_mask.values].mean()
+            acc_non = correct[~dual_mask.values].mean()
+            logger.info(f"[MODEL] Intersection diagnostic (L1×L2 dual optimal):")
+            logger.info(f"[MODEL]   Dual optimal: {acc_dual:.4f} (n={dual_mask.sum()})")
+            logger.info(f"[MODEL]   Non-dual: {acc_non:.4f} | Lift: {acc_dual - acc_non:+.4f}")
 
-    _save_model(final_model, available, target)
+    # Save model
+    _save_model(xgb_model, available_features)
 
     metrics = {
-        "target": target, "target_col": target_col,
-        "accuracy": round(accuracy, 4), "auc_roc": round(auc, 4),
-        "log_loss": round(ll, 4), "brier_score": round(brier, 4),
-        "beat_break_even": bool(accuracy > 0.5238),
-        "train_rows": len(X_train), "cal_rows": len(X_cal), "test_rows": len(X_test),
-        "features_used": len(available), "calibrated": calibrate,
-        "hyperparameters": hp, "timestamp": datetime.utcnow().isoformat(),
-        "confidence_tiers": {
-            str(t): {
-                "n": int((confidences >= t).sum()),
-                "accuracy": float(correct[confidences >= t].mean()) if (confidences >= t).sum() >= 10 else None,
-            } for t in [0.55, 0.57, 0.60, 0.65]
-        },
+        "accuracy": round(accuracy, 4),
+        "auc_roc": round(auc, 4),
+        "log_loss": round(logloss, 4),
+        "train_rows": len(X_train),
+        "test_rows": len(X_test),
+        "features_used": len(available_features),
+        "feature_importance": {k: round(v, 4) for k, v in sorted_importance},
+        "positive_rate": round(float(y.mean()), 4),
+        "hyperparameters": hp,
+        "timestamp": datetime.utcnow().isoformat(),
     }
-    if sorted_imp is not None:
-        metrics["feature_importance"] = {k: round(v, 4) for k, v in sorted_imp[:30]}
 
     logger.info("[MODEL] ============================================================")
-    logger.info(f"[MODEL] COMPLETE -- Acc={accuracy:.4f}, AUC={auc:.4f}, Brier={brier:.4f}")
+    logger.info(f"[MODEL] Training complete. Accuracy: {accuracy:.4f}, AUC: {auc:.4f}")
     logger.info("[MODEL] ============================================================")
-    return final_model, metrics
+
+    return xgb_model, metrics
 
 
-def tune_hyperparameters(featured_data, target="over_total", n_iter=50,
-                         cv_folds=5, random_state=42):
+# ---------------------------------------------------------------------------
+# Hyperparameter Tuning
+# ---------------------------------------------------------------------------
+def tune_hyperparameters(
+    featured_data: pd.DataFrame,
+    n_iter: int = 50,
+    cv_folds: int = 5,
+    random_state: int = 42,
+) -> dict:
+    """Random search over hyperparameter space with cross-validation."""
     import random as rng
+
     logger.info("[TUNE] ============================================================")
-    logger.info(f"[TUNE] Hyperparameter search: {n_iter} iterations, {cv_folds}-fold CV")
+    logger.info(f"[TUNE] Hyperparameter tuning: {n_iter} iterations, {cv_folds}-fold CV")
     logger.info("[TUNE] ============================================================")
 
-    target_col = TARGET_COLUMNS[target]
-    available = [f for f in FEATURE_COLUMNS if f in featured_data.columns]
-    X = featured_data[available].copy()
-    y = featured_data[target_col].copy()
-    valid_mask = y.notna()
-    X, y = X[valid_mask], y[valid_mask]
+    available_features = [f for f in FEATURE_COLUMNS if f in featured_data.columns]
+    X = featured_data[available_features].copy()
+    y = featured_data[TARGET_COLUMN].copy()
 
     cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
     rng.seed(random_state)
 
-    logger.info("[TUNE] Baseline (default params)...")
+    logger.info("[TUNE] Scoring baseline (default params)...")
     baseline_model = XGBClassifier(**DEFAULT_PARAMS, random_state=random_state, eval_metric="logloss")
-    baseline_scores = cross_val_score(baseline_model, X, y, cv=cv, scoring="roc_auc")
+    baseline_scores = cross_val_score(baseline_model, X, y, cv=cv, scoring="accuracy")
     baseline_mean = baseline_scores.mean()
-    logger.info(f"[TUNE] Baseline AUC: {baseline_mean:.4f} +/- {baseline_scores.std():.4f}")
+    baseline_std = baseline_scores.std()
+    logger.info(f"[TUNE] Baseline: {baseline_mean:.4f} ± {baseline_std:.4f}")
 
     all_results = []
-    best_score = 0.0
+    best_score = 0
     best_params = None
 
     for i in range(n_iter):
-        trial_params = {k: rng.choice(v) for k, v in PARAM_GRID.items()}
+        params = {key: rng.choice(values) for key, values in PARAM_GRID.items()}
         try:
-            model = XGBClassifier(**trial_params, random_state=random_state, eval_metric="logloss")
-            scores = cross_val_score(model, X, y, cv=cv, scoring="roc_auc")
+            model = XGBClassifier(**params, random_state=random_state, eval_metric="logloss")
+            scores = cross_val_score(model, X, y, cv=cv, scoring="accuracy")
             mean_score = scores.mean()
-            all_results.append({"iteration": i+1, "params": trial_params,
-                                "mean_auc": round(mean_score, 4), "std_auc": round(scores.std(), 4)})
+            std_score = scores.std()
+            result = {
+                "iteration": i + 1,
+                "params": params,
+                "mean_accuracy": round(mean_score, 4),
+                "std_accuracy": round(std_score, 4),
+                "cv_scores": [round(s, 4) for s in scores],
+            }
+            all_results.append(result)
             if mean_score > best_score:
                 best_score = mean_score
-                best_params = trial_params.copy()
-                logger.info(f"[TUNE] Iter {i+1}/{n_iter}: NEW BEST AUC={mean_score:.4f}")
-            elif (i+1) % 10 == 0:
-                logger.info(f"[TUNE] Iter {i+1}/{n_iter}: AUC={mean_score:.4f} | Best={best_score:.4f}")
+                best_params = params.copy()
+                logger.info(f"[TUNE] Iter {i+1}/{n_iter}: NEW BEST {mean_score:.4f} ± {std_score:.4f}")
+            elif (i + 1) % 10 == 0:
+                logger.info(f"[TUNE] Iter {i+1}/{n_iter}: {mean_score:.4f} | Best: {best_score:.4f}")
         except Exception as e:
             logger.warning(f"[TUNE] Iter {i+1} failed: {e}")
 
-    all_results.sort(key=lambda x: x["mean_auc"], reverse=True)
+    all_results.sort(key=lambda x: x["mean_accuracy"], reverse=True)
     improvement = best_score - baseline_mean
-    logger.info(f"[TUNE] Baseline: {baseline_mean:.4f}, Best: {best_score:.4f} (delta={improvement:+.4f})")
+
+    logger.info("[TUNE] ============================================================")
+    logger.info(f"[TUNE] Baseline:    {baseline_mean:.4f} ± {baseline_std:.4f}")
+    logger.info(f"[TUNE] Best tuned:  {best_score:.4f}")
+    logger.info(f"[TUNE] Improvement: {improvement:+.4f}")
     logger.info(f"[TUNE] Best params: {best_params}")
+    logger.info("[TUNE] ============================================================")
 
     return {
-        "baseline": {"params": DEFAULT_PARAMS, "mean_auc": round(baseline_mean, 4)},
-        "best": {"params": best_params, "mean_auc": round(best_score, 4),
-                 "improvement": round(improvement, 4)},
-        "top_10": all_results[:10], "total_iterations": len(all_results),
+        "baseline": {
+            "params": DEFAULT_PARAMS,
+            "mean_accuracy": round(baseline_mean, 4),
+            "std_accuracy": round(baseline_std, 4),
+        },
+        "best": {
+            "params": best_params,
+            "mean_accuracy": round(best_score, 4),
+            "improvement": round(improvement, 4),
+        },
+        "top_10": all_results[:10],
+        "total_iterations": len(all_results),
     }
 
 
-def _save_model(model, feature_columns, target):
-    package = {"model": model, "features": feature_columns, "target": target,
-               "saved_at": datetime.utcnow().isoformat()}
+# ---------------------------------------------------------------------------
+# Save / Load
+# ---------------------------------------------------------------------------
+def _save_model(model, feature_columns: list):
+    """Save model + feature list to local disk and S3."""
+    model_package = {
+        "model": model,
+        "features": feature_columns,
+        "saved_at": datetime.utcnow().isoformat(),
+    }
+
     with open(LOCAL_MODEL_PATH, "wb") as f:
-        pickle.dump(package, f)
+        pickle.dump(model_package, f)
     logger.info(f"[MODEL] Saved locally: {LOCAL_MODEL_PATH}")
+
     try:
+        bucket = os.environ.get("S3_BUCKET", "nfl-predictor-bucket")
         s3 = boto3.client("s3")
-        s3.upload_file(LOCAL_MODEL_PATH, S3_BUCKET, S3_MODEL_KEY)
-        logger.info(f"[MODEL] Saved to S3: s3://{S3_BUCKET}/{S3_MODEL_KEY}")
+        s3.upload_file(LOCAL_MODEL_PATH, bucket, S3_MODEL_KEY)
+        logger.info(f"[MODEL] Saved to S3: s3://{bucket}/{S3_MODEL_KEY}")
     except Exception as e:
         logger.warning(f"[MODEL] S3 save failed (non-fatal): {e}")
 
 
-def load_model():
+def load_model() -> tuple:
+    """Load model from local disk or S3."""
     if os.path.exists(LOCAL_MODEL_PATH):
         logger.info(f"[MODEL] Loading from local: {LOCAL_MODEL_PATH}")
         with open(LOCAL_MODEL_PATH, "rb") as f:
-            pkg = pickle.load(f)
-        return pkg["model"], pkg["features"], pkg.get("target", "over_total")
+            package = pickle.load(f)
+        return package["model"], package["features"]
+
     try:
+        bucket = os.environ.get("S3_BUCKET", "nfl-predictor-bucket")
         s3 = boto3.client("s3")
-        s3.download_file(S3_BUCKET, S3_MODEL_KEY, LOCAL_MODEL_PATH)
+        s3.download_file(bucket, S3_MODEL_KEY, LOCAL_MODEL_PATH)
+        logger.info(f"[MODEL] Downloaded from S3: s3://{bucket}/{S3_MODEL_KEY}")
         with open(LOCAL_MODEL_PATH, "rb") as f:
-            pkg = pickle.load(f)
-        return pkg["model"], pkg["features"], pkg.get("target", "over_total")
+            package = pickle.load(f)
+        return package["model"], package["features"]
     except Exception as e:
         logger.warning(f"[MODEL] No model found: {e}")
-        return None, None, None
-
-
-if __name__ == "__main__":
-    import argparse
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s -- %(message)s")
-    parser = argparse.ArgumentParser(description="Train NFL prediction model")
-    parser.add_argument("--target", default="over_total", choices=list(TARGET_COLUMNS.keys()))
-    parser.add_argument("--seasons", nargs="+", type=int, default=list(range(2018, 2025)))
-    parser.add_argument("--tune", action="store_true")
-    parser.add_argument("--no-calibrate", action="store_true")
-    args = parser.parse_args()
-
-    from nfl_predictor.nfl_data import load_games, load_drives
-    from nfl_predictor.feature_engineering import engineer_features
-    logger.info(f"Loading data for seasons: {args.seasons}")
-    games = load_games(args.seasons)
-    drives = load_drives(args.seasons)
-    featured = engineer_features(games, drives, target=args.target)
-
-    if args.tune:
-        tune_results = tune_hyperparameters(featured, target=args.target, n_iter=30)
-        best_params = tune_results["best"]["params"]
-    else:
-        best_params = None
-
-    model, metrics = train_model(featured, target=args.target,
-                                 calibrate=not args.no_calibrate, params=best_params)
-    logger.info(f"Training complete: {metrics}")
+        return None, None
