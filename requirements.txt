@@ -11,3 +11,4 @@ nfl-data-py==0.3.2
 pydantic==2.7.4
 shap==0.45.1
 starlette==0.37.2
+requests
