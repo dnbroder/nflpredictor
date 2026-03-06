@@ -25,6 +25,7 @@ Resources:
   # ── S3 Bucket ───────────────────────────────────────────────────────────
   DataBucket:
     Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
     Properties:
       BucketName: !Ref S3BucketName
       VersioningConfiguration:
