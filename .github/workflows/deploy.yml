@@ -55,6 +55,9 @@ jobs:
             --task-definition nfl-predictor-task-init \
             --query taskDefinition > task-definition.json
 
+      - name: Inject secrets and env vars into task definition
+        run: python3 scripts/patch_task_definition.py task-definition.json
+
       - name: Update task definition
         id: task-def
         uses: aws-actions/amazon-ecs-render-task-definition@v1
