@@ -164,16 +164,29 @@ def train_model(
         logger.info(f"[MODEL] Best eval AUC: {best_score:.6f}")
 
     # Platt scaling calibration on held-out cal set
+    # GUARD: skip Platt if XGBoost barely trained (best_iteration <= 10).
+    # With 1-2 trees, raw scores are nearly constant — Platt fits a near-zero
+    # coefficient and collapses all predictions to the mean (~0.46), making
+    # every prediction class 0. Raw probabilities are more useful in that case.
     from sklearn.linear_model import LogisticRegression
-    logger.info("[MODEL] Applying Platt scaling...")
-    raw_cal = xgb_model.predict_proba(X_cal)[:, 1].reshape(-1, 1)
-    platt = LogisticRegression(C=1.0)
-    platt.fit(raw_cal, y_cal)
-    logger.info("[MODEL] Platt scaling applied")
+    platt = None
+    use_platt = best_iteration is not None and best_iteration > 10
+    if use_platt:
+        logger.info(f"[MODEL] Applying Platt scaling (best_iteration={best_iteration} > 10)...")
+        raw_cal = xgb_model.predict_proba(X_cal)[:, 1].reshape(-1, 1)
+        platt = LogisticRegression(C=1.0)
+        platt.fit(raw_cal, y_cal)
+        logger.info("[MODEL] Platt scaling applied")
+    else:
+        logger.warning(f"[MODEL] Skipping Platt scaling — best_iteration={best_iteration} <= 10 "
+                       "(too few trees; raw probabilities more reliable than calibrated flat scores)")
 
     # Evaluate on test set
     raw_test = xgb_model.predict_proba(X_test)[:, 1].reshape(-1, 1)
-    y_proba = platt.predict_proba(raw_test)[:, 1]
+    if platt is not None:
+        y_proba = platt.predict_proba(raw_test)[:, 1]
+    else:
+        y_proba = raw_test.ravel()
     y_pred = (y_proba >= 0.5).astype(int)
 
     accuracy = accuracy_score(y_test, y_pred)

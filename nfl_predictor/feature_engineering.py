@@ -239,7 +239,15 @@ def _reshape_to_game_team(
     if closing_lines_df is not None and not closing_lines_df.empty:
         merge_cols = [c for c in ["game_id", "closing_spread", "closing_total"] if c in closing_lines_df.columns]
         if "game_id" in merge_cols:
+            # Drop any pre-existing closing_total/closing_spread columns from games_df
+            # to avoid pandas renaming them to _x/_y on merge (games_df has NaN stubs,
+            # closing_lines_df has the real data — always prefer closing_lines_df).
+            drop_cols = [c for c in ["closing_total", "closing_spread"] if c in games_df.columns and c in merge_cols]
+            if drop_cols:
+                games_df = games_df.drop(columns=drop_cols)
             games_df = games_df.merge(closing_lines_df[merge_cols], on="game_id", how="left")
+            n_merged = games_df["closing_total"].notna().sum() if "closing_total" in games_df.columns else 0
+            logger.info(f"[FEAT] Closing lines merged: {n_merged}/{len(games_df)} games have closing_total")
 
     for _, game in games_df.iterrows():
         base = {
