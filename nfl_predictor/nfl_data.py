@@ -524,8 +524,13 @@ def load_closing_lines(
 
                 season_api_events += len(day_events)
 
-                # Log per-day event count at DEBUG — surfaces fetch gaps immediately
-                expected_games = len(season_games[season_games["gameday"] == gameday])
+                # Log per-day event count — use same ±3 day window for expected count
+                gameday_ts = pd.Timestamp(gameday)
+                window_games = season_games[
+                    (season_games["gameday"] >= gameday_ts - pd.Timedelta(days=3)) &
+                    (season_games["gameday"] <= gameday_ts + pd.Timedelta(days=3))
+                ]
+                expected_games = len(window_games)
                 if len(day_events) < expected_games:
                     logger.warning(
                         f"[DATA]   {day_str}: API returned {len(day_events)} events, "
@@ -573,9 +578,18 @@ def load_closing_lines(
                         season_no_abbr += 1
                         continue
 
-                    # Match to schedule by date + abbreviations
+                    # Match to schedule by team abbreviations within ±3 day window.
+                    # The Odds API event dates don't always align exactly with
+                    # nfl-data-py schedule dates — the API may return events a few
+                    # days before or after the actual gameday. Match on teams only
+                    # within a tight window to avoid cross-week false matches.
+                    gameday_ts = pd.Timestamp(gameday)
+                    date_window = (
+                        (season_games["gameday"] >= gameday_ts - pd.Timedelta(days=3)) &
+                        (season_games["gameday"] <= gameday_ts + pd.Timedelta(days=3))
+                    )
                     mask = (
-                        (season_games["gameday"] == gameday) &
+                        date_window &
                         (season_games["home_team"] == home_abbr) &
                         (season_games["away_team"] == away_abbr)
                     )
@@ -584,7 +598,7 @@ def load_closing_lines(
                     if len(matched) == 0:
                         # Try flipped — neutral site or data inconsistency
                         mask_flipped = (
-                            (season_games["gameday"] == gameday) &
+                            date_window &
                             (season_games["home_team"] == away_abbr) &
                             (season_games["away_team"] == home_abbr)
                         )
