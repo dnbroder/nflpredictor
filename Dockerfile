@@ -6,14 +6,14 @@ WORKDIR /app
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install system dependencies
-# pip upgrade silences the "new release available" notice on every build
+# --root-user-action=ignore suppresses pip-as-root warning (fine in containers)
+# pip upgrade also silences the "new release available" notice on every build
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --upgrade pip --quiet
+    && pip install --upgrade pip --quiet --root-user-action=ignore
 
 # Install Python dependencies
-# pip install as root is fine in a container — suppress the venv warning
 COPY requirements.txt .
 RUN pip install --no-cache-dir --root-user-action=ignore -r requirements.txt
 
