@@ -457,6 +457,9 @@ def load_closing_lines(
         sport = "americanfootball_nfl"
         regions = "us"
         markets = "totals,spreads"
+        # DraftKings only — single sharp book cuts credit consumption ~80% vs all-us-books.
+        # DK closing lines are liquid and sharp enough for feature construction and target.
+        bookmaker = "draftkings"
 
         # Fetch three timestamps per gameday to capture all game windows:
         #   18:00Z = 1pm ET (early Sunday window)
@@ -488,6 +491,7 @@ def load_closing_lines(
                         "apiKey": api_key,
                         "regions": regions,
                         "markets": markets,
+                        "bookmakers": "draftkings",  # single book = ~80% fewer credits consumed
                         "date": date_str,
                         "oddsFormat": "american",
                     }
@@ -502,13 +506,34 @@ def load_closing_lines(
                                 if event_id and event_id not in day_events:
                                     day_events[event_id] = event
                                     new_events += 1
-                            # Log remaining credits if available in headers
+                            # Track credits on every successful call — log at INFO
+                            # so we always know where we stand without digging
                             credits_remaining = resp.headers.get("x-requests-remaining")
                             credits_used = resp.headers.get("x-requests-used")
-                            logger.debug(
-                                f"[DATA]   {date_str}: {len(events)} events returned, "
-                                f"{new_events} new — credits used={credits_used} remaining={credits_remaining}"
+                            credits_last = resp.headers.get("x-requests-last")
+                            logger.info(
+                                f"[DATA]   {date_str}: {len(events)} events, {new_events} new | "
+                                f"credits used={credits_used} remaining={credits_remaining} "
+                                f"(this call={credits_last})"
                             )
+                            # Warn loudly at credit thresholds
+                            if credits_remaining is not None:
+                                rem = int(credits_remaining)
+                                if rem == 0:
+                                    logger.error(
+                                        f"[DATA] CREDITS EXHAUSTED — 0 remaining. "
+                                        f"Upgrade at https://the-odds-api.com"
+                                    )
+                                    return pd.DataFrame()
+                                elif rem < 500:
+                                    logger.warning(
+                                        f"[DATA] ⚠️  CRITICAL: Only {rem} credits remaining — "
+                                        f"fetch may not complete. Consider upgrading plan."
+                                    )
+                                elif rem < 2000:
+                                    logger.warning(
+                                        f"[DATA] ⚠️  LOW CREDITS: {rem} remaining — monitor closely"
+                                    )
                         elif resp.status_code == 422:
                             logger.debug(f"[DATA]   {date_str}: no odds data (422)")
                         elif resp.status_code == 401:
@@ -518,6 +543,17 @@ def load_closing_lines(
                             logger.error(f"[DATA] Odds API rate limit hit — aborting. Credits exhausted.")
                             return pd.DataFrame()
                         else:
+                            # Check for out-of-credits in response body
+                            try:
+                                err = resp.json()
+                                if err.get("error_code") == "OUT_OF_USAGE_CREDITS":
+                                    logger.error(
+                                        f"[DATA] Odds API credits exhausted — aborting. "
+                                        f"Upgrade plan at https://the-odds-api.com"
+                                    )
+                                    return pd.DataFrame()
+                            except Exception:
+                                pass
                             logger.warning(f"[DATA]   {date_str}: HTTP {resp.status_code} — {resp.text[:200]}")
                     except Exception as e:
                         logger.warning(f"[DATA]   {date_str}: request failed — {e}")
