@@ -2,14 +2,20 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# Silence debconf warnings during apt — no TTY available in Docker build
+ENV DEBIAN_FRONTEND=noninteractive
+
 # Install system dependencies
+# pip upgrade silences the "new release available" notice on every build
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --upgrade pip --quiet
 
 # Install Python dependencies
+# pip install as root is fine in a container — suppress the venv warning
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --root-user-action=ignore -r requirements.txt
 
 # Copy application
 COPY . .

@@ -96,6 +96,49 @@ PBP_COLS = [
 ]
 
 
+# FIX: The Odds API returns full team names; nfl_data_py uses abbreviations.
+# This map handles historical name changes (Raiders move, Rams move, etc.)
+ODDS_API_TEAM_MAP = {
+    "Arizona Cardinals":      "ARI",
+    "Atlanta Falcons":        "ATL",
+    "Baltimore Ravens":       "BAL",
+    "Buffalo Bills":          "BUF",
+    "Carolina Panthers":      "CAR",
+    "Chicago Bears":          "CHI",
+    "Cincinnati Bengals":     "CIN",
+    "Cleveland Browns":       "CLE",
+    "Dallas Cowboys":         "DAL",
+    "Denver Broncos":         "DEN",
+    "Detroit Lions":          "DET",
+    "Green Bay Packers":      "GB",
+    "Houston Texans":         "HOU",
+    "Indianapolis Colts":     "IND",
+    "Jacksonville Jaguars":   "JAX",
+    "Kansas City Chiefs":     "KC",
+    "Las Vegas Raiders":      "LV",
+    "Oakland Raiders":        "OAK",
+    "Los Angeles Chargers":   "LAC",
+    "San Diego Chargers":     "SD",
+    "Los Angeles Rams":       "LA",
+    "St. Louis Rams":         "STL",
+    "Miami Dolphins":         "MIA",
+    "Minnesota Vikings":      "MIN",
+    "New England Patriots":   "NE",
+    "New Orleans Saints":     "NO",
+    "New York Giants":        "NYG",
+    "New York Jets":          "NYJ",
+    "Philadelphia Eagles":    "PHI",
+    "Pittsburgh Steelers":    "PIT",
+    "San Francisco 49ers":    "SF",
+    "Seattle Seahawks":       "SEA",
+    "Tampa Bay Buccaneers":   "TB",
+    "Tennessee Titans":       "TEN",
+    "Washington Commanders":  "WAS",
+    "Washington Football Team": "WAS",
+    "Washington Redskins":    "WAS",
+}
+
+
 # ---------------------------------------------------------------------------
 # Public API — mirrors GolfPredictor historical_data.py
 # ---------------------------------------------------------------------------
@@ -185,26 +228,6 @@ def load_drives(
         _save_to_s3(drives, cache_key)
     return drives
 
-
-def load_plays(
-    seasons: List[int] = None,
-    cache: bool = True,
-) -> pd.DataFrame:
-    """
-    Load play-by-play data. Large (~1M rows for full history).
-    Used as raw input for drive aggregation and L3 PIC computation.
-
-    Columns: see PBP_COLS above — trimmed from full nflfastR schema
-    to manage memory (~300+ columns in raw form).
-    """
-    seasons = seasons or list(range(2016, CURRENT_SEASON + 1))
-    cache_key = f"data/pbp/plays_{min(seasons)}_{max(seasons)}.parquet"
-
-    if cache:
-        cached = _load_from_s3(cache_key)
-        if cached is not None:
-            logger.info(f"[DATA] Loaded {len(cached)} plays from S3 cache")
-            return cached
 
 def load_plays(
     seasons: List[int] = None,
