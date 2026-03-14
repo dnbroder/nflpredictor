@@ -219,9 +219,11 @@ def load_drives(
         logger.info(f"[DATA] S3 cache MISS — building drives from PBP")
 
     logger.info(f"[DATA] Building drives from PBP for seasons {seasons}...")
-    pbp = load_plays(seasons, cache=False)
+    pbp = load_plays(seasons, cache=True)
     logger.info(f"[DATA] PBP loaded: {len(pbp)} plays — aggregating to drives...")
+    t_agg = time.time()
     drives = _aggregate_to_drives(pbp)
+    logger.info(f"[DATA] Drive aggregation done in {time.time()-t_agg:.1f}s — {len(drives)} drives")
     logger.info(f"[DATA] Drives complete: {len(drives)} rows in {time.time()-t0:.1f}s total")
 
     if cache:
@@ -247,7 +249,8 @@ def load_plays(
         logger.info(f"[DATA] Checking S3 cache: {cache_key}")
         cached = _load_from_s3(cache_key)
         if cached is not None:
-            logger.info(f"[DATA] S3 cache HIT: {len(cached)} plays in {time.time()-t0:.1f}s")
+            mb = cached.memory_usage(deep=True).sum() / 1024 / 1024
+            logger.info(f"[DATA] PBP S3 cache HIT: {len(cached)} plays ({mb:.0f}MB) in {time.time()-t0:.1f}s")
             return cached
         logger.info(f"[DATA] S3 cache MISS — downloading PBP from nfl-data-py")
 
@@ -275,8 +278,9 @@ def load_plays(
         logger.info(f"[DATA] Total plays: {len(result)} rows, {total_mb:.1f}MB in {time.time()-t0:.1f}s total")
 
         if cache:
-            logger.info(f"[DATA] Caching PBP to S3...")
+            logger.info(f"[DATA] Caching PBP to S3 ({total_mb:.0f}MB) — this may take ~30s...")
             _save_to_s3(result, cache_key)
+            logger.info(f"[DATA] PBP cached to S3: {cache_key}")
 
         return result
 
