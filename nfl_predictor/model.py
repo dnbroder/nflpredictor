@@ -96,6 +96,14 @@ def train_model(
     X = featured_data[available_features].copy()
     y = featured_data[TARGET_COLUMN].copy()
 
+    # Closing lines entry diagnostic — confirm closing_total value at model boundary
+    if "closing_total" in X.columns:
+        ct_valid = X["closing_total"].notna().sum()
+        ct_sample = X["closing_total"].dropna().head(3).tolist()
+        logger.info(f"[MODEL] closing_total in X: {ct_valid}/{len(X)} valid, sample={ct_sample}")
+    else:
+        logger.error("[MODEL] closing_total NOT in X — dropped during feature selection")
+
     # Pre-training NaN audit
     nan_counts = X.isnull().sum()
     cols_with_nans = nan_counts[nan_counts > 0]

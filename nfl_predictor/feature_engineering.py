@@ -812,6 +812,7 @@ def _build_epa_features(df: pd.DataFrame, epa_df: pd.DataFrame = None) -> pd.Dat
     epa = epa_df[epa_cols].copy()
 
     df = df.merge(epa, on=["game_id", "team"], how="left")
+    df = df.reset_index(drop=True)
 
     # Use 5g rolling as primary, fall back to season avg
     df["epa_offense_avg"] = df["epa_off_5g"].fillna(df.get("epa_off_season", np.nan))
@@ -839,6 +840,7 @@ def _build_qb_features(df: pd.DataFrame, qb_df: pd.DataFrame = None) -> pd.DataF
     qb = qb_df[qb_cols].copy()
 
     df = df.merge(qb, on=["game_id", "team"], how="left")
+    df = df.reset_index(drop=True)
 
     if "qb_epa_5g" in df.columns:
         df["pic_composite_l1"] = df["qb_epa_5g"]
@@ -861,7 +863,7 @@ def _build_standard_features(df: pd.DataFrame, games_df: pd.DataFrame) -> pd.Dat
     # Rest days computation
     if "gameday" in df.columns:
         df["gameday"] = pd.to_datetime(df["gameday"])
-        df = df.sort_values(["team", "gameday"])
+        df = df.sort_values(["team", "gameday"]).reset_index(drop=True)
         df["prev_gameday"] = df.groupby("team")["gameday"].shift(1)
         df["rest_days"] = (df["gameday"] - df["prev_gameday"]).dt.days
         df["rest_days"] = df["rest_days"].fillna(7).clip(4, 21)  # cap at reasonable range
