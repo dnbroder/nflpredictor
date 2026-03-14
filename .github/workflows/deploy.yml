@@ -68,6 +68,21 @@ jobs:
       - name: Inject secrets and env vars into task definition
         run: python3 nfl_predictor/patch_task_definition.py task-definition.json
 
+      - name: Verify task definition secrets
+        run: |
+          echo "=== Secrets in task definition ==="
+          python3 -c "
+          import json
+          with open('task-definition.json') as f:
+              td = json.load(f)
+          cd = td['containerDefinitions'][0]
+          for s in cd.get('secrets', []):
+              print(f\"  {s['name']}: {s['valueFrom']}\")
+          print('=== Environment vars ===')
+          for e in cd.get('environment', []):
+              print(f\"  {e['name']}: {e['value']}\")
+          "
+
       - name: Update task definition
         id: task-def
         # v1.4.0+ uses Node.js 24
