@@ -285,6 +285,14 @@ def train_async(
             featured = engineer_features(games, drives, closing_lines_df=closing_lines, epa_df=epa, qb_df=qb)
             logger.info(f"[ASYNC-TRAIN {job_id}] Features: {len(featured)} rows")
 
+            # Diagnostic: verify closing_total survived the full pipeline before hitting model
+            if "closing_total" in featured.columns:
+                ct_valid = featured["closing_total"].notna().sum()
+                ct_sample = featured["closing_total"].dropna().head(3).tolist()
+                logger.info(f"[ASYNC-TRAIN {job_id}] closing_total handoff: {ct_valid}/{len(featured)} valid, sample={ct_sample}")
+            else:
+                logger.error(f"[ASYNC-TRAIN {job_id}] closing_total MISSING from featured df — column not present")
+
             logger.info(f"[ASYNC-TRAIN {job_id}] Training model...")
             model, metrics = train_model(featured)
 
