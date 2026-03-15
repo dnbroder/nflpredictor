@@ -23,6 +23,15 @@ REQUIRED_ENV = [
     {"name": "LOG_LEVEL", "value": "INFO"},
 ]
 
+# Health check with generous startPeriod — container imports heavy ML libs on boot
+HEALTH_CHECK = {
+    "command": ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"],
+    "interval": 30,
+    "timeout": 10,
+    "retries": 3,
+    "startPeriod": 120,
+}
+
 
 def patch(path: str) -> None:
     with open(path) as f:
@@ -65,6 +74,12 @@ def patch(path: str) -> None:
             added_env.append(var["name"])
 
     cd["environment"] = env
+
+    # Patch health check — always enforce our settings
+    existing_hc = cd.get("healthCheck", {})
+    if existing_hc != HEALTH_CHECK:
+        cd["healthCheck"] = HEALTH_CHECK
+        print(f"Updated healthCheck: startPeriod={HEALTH_CHECK['startPeriod']}s, timeout={HEALTH_CHECK['timeout']}s")
 
     with open(path, "w") as f:
         json.dump(td, f, indent=2)
