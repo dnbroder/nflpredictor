@@ -255,11 +255,20 @@ def load_plays(
         logger.info(f"[DATA] S3 cache MISS — downloading PBP from nfl-data-py")
 
     logger.info(f"[DATA] Loading PBP for {len(seasons)} seasons: {seasons}")
-    logger.info(f"[DATA] WARNING: PBP download is large (~500MB/season) — this may take several minutes")
+    logger.info(f"[DATA] Caching per-season to S3 — OOM kills won't lose completed seasons")
     try:
         import nfl_data_py as nfl
         dfs = []
         for i, season in enumerate(seasons, 1):
+            # Check per-season S3 cache first — survives OOM kills mid-run
+            season_cache_key = f"data/pbp/plays_{season}.parquet"
+            season_cached = _load_from_s3(season_cache_key) if cache else None
+            if season_cached is not None:
+                mb = season_cached.memory_usage(deep=True).sum() / 1024 / 1024
+                logger.info(f"[DATA] Season {season} PBP cache HIT: {len(season_cached)} plays ({mb:.0f}MB)")
+                dfs.append(season_cached)
+                continue
+
             t1 = time.time()
             logger.info(f"[DATA] Downloading PBP season {season} ({i}/{len(seasons)})...")
             df = nfl.import_pbp_data([season], downcast=True)
@@ -270,15 +279,21 @@ def load_plays(
             elapsed = time.time() - t1
             mb = df.memory_usage(deep=True).sum() / 1024 / 1024
             logger.info(f"[DATA] Season {season} done: {len(df)} plays, {mb:.1f}MB in {elapsed:.1f}s")
+
+            # Cache immediately — completed seasons survive if container OOMs
+            if cache:
+                _save_to_s3(df, season_cache_key)
+                logger.info(f"[DATA] Season {season} cached: {season_cache_key}")
+
             dfs.append(df)
 
-        logger.info(f"[DATA] All seasons downloaded — concatenating {len(dfs)} dataframes...")
+        logger.info(f"[DATA] All {len(seasons)} seasons ready — concatenating...")
         result = pd.concat(dfs, ignore_index=True)
         total_mb = result.memory_usage(deep=True).sum() / 1024 / 1024
         logger.info(f"[DATA] Total plays: {len(result)} rows, {total_mb:.1f}MB in {time.time()-t0:.1f}s total")
 
         if cache:
-            logger.info(f"[DATA] Caching PBP to S3 ({total_mb:.0f}MB) — this may take ~30s...")
+            logger.info(f"[DATA] Caching combined PBP to S3 ({total_mb:.0f}MB)...")
             _save_to_s3(result, cache_key)
             logger.info(f"[DATA] PBP cached to S3: {cache_key}")
 
