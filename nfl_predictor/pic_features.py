@@ -86,7 +86,6 @@ def build_pic_features(
     df: pd.DataFrame,           # game-team rows (output of L1/L2 pipeline)
     pbp_df: pd.DataFrame,       # full play-by-play with offense_players column
     players_df: pd.DataFrame,   # nfl_data_py import_players()
-    snap_df: pd.DataFrame,      # nfl_data_py import_snap_counts()
     logger=None,
 ) -> pd.DataFrame:
     """
@@ -98,7 +97,6 @@ def build_pic_features(
                     Should include full history (pic_history_start→train_end)
                     for cold start resolution.
         players_df: Player identity table (gsis_id → position, pfr_id)
-        snap_df:    Snap count data (pfr_id, game_id → offense_pct)
         logger:     Logger instance
 
     Returns:
@@ -114,7 +112,7 @@ def build_pic_features(
     # Step 1: Build player identity + quality lookup
     if logger:
         logger.info("[PIC] Step 1: Building player identity and quality lookup...")
-    player_lookup, snap_lookup, snap_lookup_by_gsis = _build_player_lookups(players_df, snap_df, logger)
+    player_lookup, snap_lookup_by_gsis = _build_player_lookups(players_df, logger)
 
     # Step 1b: Compute career EPA quality scores from full PBP history
     if logger:
@@ -137,7 +135,7 @@ def build_pic_features(
     # Step 3: Aggregate drive personnel — base group + key player presence
     if logger:
         logger.info("[PIC] Step 3: Aggregating drive-level personnel...")
-    drive_personnel = _aggregate_drive_personnel(pbp_off, player_lookup, snap_lookup, snap_lookup_by_gsis, logger)
+    drive_personnel = _aggregate_drive_personnel(pbp_off, player_lookup, snap_lookup_by_gsis, logger)
 
     # Step 4: Compute per-player PIC cycles from drive history
     if logger:
@@ -148,7 +146,7 @@ def build_pic_features(
     if logger:
         logger.info("[PIC] Step 5: Building game-level PIC features...")
     game_pic = _build_game_pic_features(
-        drive_personnel, player_cycles, player_lookup, snap_lookup, snap_lookup_by_gsis, pbp_snap_pct, career_epa, logger
+        drive_personnel, player_cycles, player_lookup, snap_lookup_by_gsis, pbp_snap_pct, career_epa, logger
     )
 
     # Step 6: Merge onto game-team rows
@@ -171,13 +169,15 @@ def build_pic_features(
 
 def _build_player_lookups(
     players_df: pd.DataFrame,
-    snap_df: pd.DataFrame,
     logger=None,
 ) -> Tuple[Dict, Dict]:
     """
     Build two lookup dicts:
-        player_lookup: gsis_id → {position, pfr_id, display_name}
-        snap_lookup:   (pfr_id, game_id) → {offense_snaps, offense_pct}
+        player_lookup:        gsis_id → {position, pfr_id, display_name}
+        snap_lookup_by_gsis:  (gsis_id, game_id) → snap data (bridged from pfr_id)
+                              NOTE: 44% bridge rate due to pfr_id namespace mismatch.
+                              Primary snap source is now PBP-derived (_compute_pbp_snap_pct).
+                              This remains as a fallback only.
     """
     # Player identity — filter to offensive positions only
     player_lookup = {}
@@ -199,44 +199,14 @@ def _build_player_lookups(
                    f"({n_with_pfr} with pfr_id, {n_no_pfr} missing pfr_id — "
                    f"external snap lookup will miss {n_no_pfr/len(player_lookup)*100:.0f}% of players)")
 
-    # Snap counts — only offensive snaps matter
-    # Primary key: (pfr_player_id, game_id) — matches player_lookup pfr_id
-    snap_lookup = {}
-    for _, row in snap_df.iterrows():
-        pfr_id = row.get("pfr_player_id", "")
-        game_id = row.get("game_id", "")
-        if pfr_id and game_id:
-            snap_lookup[(pfr_id, game_id)] = {
-                "offense_snaps": row.get("offense_snaps", 0) or 0,
-                "offense_pct":   row.get("offense_pct", 0) or 0,
-            }
-
+    # snap_lookup_by_gsis is now empty — snap data comes from PBP directly.
+    # Kept as empty dict for signature compatibility; fallback path in
+    # _build_game_pic_features handles the None case gracefully.
+    snap_lookup_by_gsis: Dict = {}
     if logger:
-        logger.info(f"[PIC]   Snap lookup: {len(snap_lookup)} player-game records")
+        logger.info(f"[PIC]   External snap lookup disabled — using PBP-derived snap_pct (100% gsis coverage)")
 
-    # Build reverse map: pfr_id → gsis_id for players missing pfr_id in snap data
-    # Snap counts use pfr_player_id; PBP offense_players uses gsis_id.
-    # 10% of players have no pfr_id — build a gsis→snap fallback using player name matching.
-    # Simpler approach: build a gsis_id keyed snap lookup as well using the players_df bridge.
-    pfr_to_gsis = {}
-    for gsis, info in player_lookup.items():
-        pfr = info.get("pfr_id", "")
-        if pfr:
-            pfr_to_gsis[pfr] = gsis
-
-    # Build gsis-keyed snap lookup for players whose pfr_id is missing
-    # This allows direct gsis_id lookup as fallback
-    snap_lookup_by_gsis = {}
-    for (pfr_id, game_id), snap_data in snap_lookup.items():
-        gsis = pfr_to_gsis.get(pfr_id)
-        if gsis:
-            snap_lookup_by_gsis[(gsis, game_id)] = snap_data
-
-    if logger:
-        logger.info(f"[PIC]   Snap lookup by gsis_id: {len(snap_lookup_by_gsis)} player-game records "
-                   f"({len(snap_lookup_by_gsis)/max(len(snap_lookup),1)*100:.0f}% of snap records bridged)")
-
-    return player_lookup, snap_lookup, snap_lookup_by_gsis
+    return player_lookup, snap_lookup_by_gsis
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +452,6 @@ def _filter_offensive_plays(pbp_df: pd.DataFrame, logger=None) -> pd.DataFrame:
 def _aggregate_drive_personnel(
     pbp_off: pd.DataFrame,
     player_lookup: Dict,
-    snap_lookup: Dict,
     snap_lookup_by_gsis: Dict,
     logger=None,
 ) -> pd.DataFrame:
@@ -786,7 +755,6 @@ def _build_game_pic_features(
     drive_personnel: pd.DataFrame,
     player_cycles: Dict,
     player_lookup: Dict,
-    snap_lookup: Dict,
     snap_lookup_by_gsis: Dict,
     pbp_snap_pct: Dict,
     career_epa: Dict,
@@ -817,6 +785,10 @@ def _build_game_pic_features(
     _snap_from_external = 0
     _snap_below_threshold = 0
     _snap_missing = 0
+    # QB lookup diagnostic counters
+    _qb_primary_hit = 0    # qb_id found directly in player_cycles
+    _qb_fallback_hit = 0   # qb_id not found, fallback scan found a QB
+    _qb_miss = 0           # no QB cycle found at all
 
     # Build ordered game list per team for lag — MUST sort by season+week, not game_id string.
     # game_id strings like "2020_01_ARI_SF" sort alphabetically within a week,
@@ -874,7 +846,32 @@ def _build_game_pic_features(
                 prev_state = qb_cycles["game_states"].get(prev_game_id)
                 if prev_state:
                     qb_zone = prev_state["l1_zone"]
-            qb_career_rate = player_cycles.get(qb_id, {}).get("career_scoring_rate", np.nan)
+            # career_scoring_rate: look up by qb_id directly.
+            # qb_id comes from passer_player_id which is the same gsis_id
+            # namespace as offense_players — but some QBs are absent from
+            # player_cycles if they had <MIN_DRIVES_FOR_BASELINE drives.
+            # Fallback: scan all_game_players for a QB position match.
+            if qb_id in player_cycles:
+                qb_career_rate = player_cycles[qb_id].get("career_scoring_rate", np.nan)
+                _qb_primary_hit += 1
+            else:
+                # Try finding the QB via their appearance in all_game_players
+                found_fallback = False
+                for candidate in all_game_players:
+                    info = player_lookup.get(candidate)
+                    if info and info.get("position") == "QB" and candidate in player_cycles:
+                        qb_career_rate = player_cycles[candidate].get("career_scoring_rate", np.nan)
+                        qb_id = candidate  # update so cycle lookup also works
+                        qb_cycles = player_cycles.get(qb_id)
+                        if qb_cycles and prev_game_id:
+                            prev_state = qb_cycles["game_states"].get(prev_game_id)
+                            if prev_state:
+                                qb_zone = prev_state["l1_zone"]
+                        found_fallback = True
+                        _qb_fallback_hit += 1
+                        break
+                if not found_fallback:
+                    _qb_miss += 1
 
         # Get snap-weighted player states
         for gsis in all_game_players:
@@ -889,15 +886,12 @@ def _build_game_pic_features(
             # Snap percentage this game as usage weight.
             # PRIMARY: PBP-derived snap pct — computed from offense_players column,
             # no external join needed. 100% gsis_id coverage.
-            # FALLBACK: external snap_lookup (pfr_id) and snap_lookup_by_gsis for
-            # any edge cases where PBP data is missing offense_players.
+            # FALLBACK: snap_lookup_by_gsis (empty dict, kept for compatibility).
             snap_pct = pbp_snap_pct.get((gsis, game_id), None)
             if snap_pct is not None:
                 _snap_from_pbp += 1
             else:
-                snap_info = snap_lookup.get((pfr_id, game_id), {})
-                if not snap_info:
-                    snap_info = snap_lookup_by_gsis.get((gsis, game_id), {})
+                snap_info = snap_lookup_by_gsis.get((gsis, game_id), {})
                 snap_pct = snap_info.get("offense_pct", 0) or 0
                 if snap_pct > 0:
                     _snap_from_external += 1
@@ -972,6 +966,11 @@ def _build_game_pic_features(
         logger.info(f"[PIC]     External fallback:       {_snap_from_external} ({_snap_from_external/max(total_lookups,1)*100:.0f}%)")
         logger.info(f"[PIC]     Below threshold (≥{MIN_SNAP_PCT_THRESHOLD}): {_snap_below_threshold} ({_snap_below_threshold/max(total_lookups,1)*100:.0f}%) — filtered out")
         logger.info(f"[PIC]     Missing entirely:        {_snap_missing} ({_snap_missing/max(total_lookups,1)*100:.0f}%) — treated as absent")
+        total_qb = _qb_primary_hit + _qb_fallback_hit + _qb_miss
+        logger.info(f"[PIC]   QB cycle lookup ({total_qb} games with QB identified):")
+        logger.info(f"[PIC]     Primary hit (passer_id in cycles): {_qb_primary_hit} ({_qb_primary_hit/max(total_qb,1)*100:.0f}%)")
+        logger.info(f"[PIC]     Fallback hit (scan all_game_players): {_qb_fallback_hit} ({_qb_fallback_hit/max(total_qb,1)*100:.0f}%)")
+        logger.info(f"[PIC]     Miss (no QB cycles found): {_qb_miss} ({_qb_miss/max(total_qb,1)*100:.0f}%)")
         logger.info(f"[PIC]   Game PIC features: {len(df)} team-game rows")
         for col in ["pic_qb_in_zone", "pic_ol_sync_rate", "pic_team_alignment",
                     "pic_skill_sync_rate", "pic_present_quality", "pic_avg_player_epa"]:

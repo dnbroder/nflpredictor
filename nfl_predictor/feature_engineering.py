@@ -140,7 +140,6 @@ def engineer_features(
     drives_df: pd.DataFrame,
     pbp_df: pd.DataFrame = None,
     players_df: pd.DataFrame = None,
-    snap_df: pd.DataFrame = None,
     contracts_df: pd.DataFrame = None,
     closing_lines_df: pd.DataFrame = None,
     epa_df: pd.DataFrame = None,
@@ -202,10 +201,10 @@ def engineer_features(
     # Step 6b: Layer 3 — PIC Player Impact Curve
     logger.info("[FEAT] Step 6b: Building PIC features (Layer 3)...")
     t6b = time.time()
-    if pbp_df is not None and players_df is not None and snap_df is not None:
+    if pbp_df is not None and players_df is not None:
         try:
             from nfl_predictor.pic_features import build_pic_features
-            df = build_pic_features(df, pbp_df, players_df, snap_df, logger=logger)
+            df = build_pic_features(df, pbp_df, players_df, logger=logger)
             logger.info(f"[FEAT]   Step 6b done in {time.time()-t6b:.1f}s")
         except Exception as e:
             logger.warning(f"[FEAT]   PIC build failed (non-fatal): {e} — filling stubs")
@@ -213,7 +212,7 @@ def engineer_features(
                 if col not in df.columns:
                     df[col] = np.nan
     else:
-        logger.warning("[FEAT]   PIC skipped — pbp_df, players_df or snap_df not provided")
+        logger.warning("[FEAT]   PIC skipped — pbp_df or players_df not provided")
         for col in [c for c in FEATURE_COLUMNS if c.startswith("pic_")]:
             if col not in df.columns:
                 df[col] = np.nan

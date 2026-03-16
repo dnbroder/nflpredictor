@@ -176,30 +176,41 @@ def train_model(
     if best_score:
         logger.info(f"[MODEL] Best eval AUC: {best_score:.6f}")
 
-    # Platt scaling calibration on held-out cal set
-    # GUARD: skip Platt if XGBoost barely trained (best_iteration <= 10).
-    # With 1-2 trees, raw scores are nearly constant — Platt fits a near-zero
-    # coefficient and collapses all predictions to the mean (~0.46), making
-    # every prediction class 0. Raw probabilities are more useful in that case.
-    from sklearn.linear_model import LogisticRegression
-    platt = None
-    use_platt = best_iteration is not None and best_iteration > 10
-    if use_platt:
-        logger.info(f"[MODEL] Applying Platt scaling (best_iteration={best_iteration} > 10)...")
-        raw_cal = xgb_model.predict_proba(X_cal)[:, 1].reshape(-1, 1)
-        platt = LogisticRegression(C=1.0)
-        platt.fit(raw_cal, y_cal)
-        logger.info("[MODEL] Platt scaling applied")
+    # Probability calibration on held-out cal set.
+    # GUARD: skip calibration if XGBoost barely trained (best_iteration <= 10).
+    # With 1-2 trees, raw scores are nearly constant — calibration fits a flat
+    # function and collapses all predictions to the mean (~0.46).
+    from sklearn.isotonic import IsotonicRegression
+    calibrator = None
+    use_calibration = best_iteration is not None and best_iteration > 10
+    if use_calibration:
+        raw_cal = xgb_model.predict_proba(X_cal)[:, 1]
+        logger.info(f"[MODEL] Calibrating (isotonic regression, best_iteration={best_iteration} > 10)...")
+        logger.info(f"[MODEL]   Raw cal proba — mean={raw_cal.mean():.3f}, "
+                   f"min={raw_cal.min():.3f}, max={raw_cal.max():.3f}")
+        calibrator = IsotonicRegression(out_of_bounds="clip")
+        calibrator.fit(raw_cal, y_cal)
+        # Diagnostic: check cal set output range post-calibration
+        cal_out = calibrator.predict(raw_cal)
+        logger.info(f"[MODEL]   Post-calibration — mean={cal_out.mean():.3f}, "
+                   f"min={cal_out.min():.3f}, max={cal_out.max():.3f}, "
+                   f"above_0.5={( cal_out >= 0.5).sum()}/{len(cal_out)}")
+        logger.info("[MODEL] Calibration applied")
     else:
-        logger.warning(f"[MODEL] Skipping Platt scaling — best_iteration={best_iteration} <= 10 "
+        logger.warning(f"[MODEL] Skipping calibration — best_iteration={best_iteration} <= 10 "
                        "(too few trees; raw probabilities more reliable than calibrated flat scores)")
 
     # Evaluate on test set
-    raw_test = xgb_model.predict_proba(X_test)[:, 1].reshape(-1, 1)
-    if platt is not None:
-        y_proba = platt.predict_proba(raw_test)[:, 1]
+    raw_test = xgb_model.predict_proba(X_test)[:, 1]
+    if calibrator is not None:
+        y_proba = calibrator.predict(raw_test)
+        logger.info(f"[MODEL]   Raw test proba — mean={raw_test.mean():.3f}, "
+                   f"min={raw_test.min():.3f}, max={raw_test.max():.3f}")
+        logger.info(f"[MODEL]   Calibrated test — mean={y_proba.mean():.3f}, "
+                   f"min={y_proba.min():.3f}, max={y_proba.max():.3f}, "
+                   f"above_0.5={(y_proba >= 0.5).sum()}/{len(y_proba)}")
     else:
-        y_proba = raw_test.ravel()
+        y_proba = raw_test
     y_pred = (y_proba >= 0.5).astype(int)
 
     accuracy = accuracy_score(y_test, y_pred)
@@ -217,6 +228,24 @@ def train_model(
     for line in report.split("\n"):
         if line.strip():
             logger.info(f"[MODEL]   {line}")
+
+    # Probability spread diagnostic — critical for catching calibration collapse.
+    # If isotonic is working correctly, you should see a spread across 0.3-0.7.
+    # If everything is still < 0.5, calibration is still compressing signal.
+    logger.info("[MODEL] Probability spread diagnostic (test set):")
+    logger.info(f"[MODEL]   Raw XGBoost    — mean={raw_test.mean():.3f}, "
+               f"std={raw_test.std():.3f}, "
+               f"min={raw_test.min():.3f}, max={raw_test.max():.3f}, "
+               f"above_0.5={(raw_test >= 0.5).sum()}/{len(raw_test)}")
+    logger.info(f"[MODEL]   Final (calibrated) — mean={y_proba.mean():.3f}, "
+               f"std={y_proba.std():.3f}, "
+               f"min={y_proba.min():.3f}, max={y_proba.max():.3f}, "
+               f"above_0.5={(y_proba >= 0.5).sum()}/{len(y_proba)}")
+    # Percentile breakdown — shows the full distribution shape
+    percentiles = [10, 25, 50, 75, 90]
+    pct_vals = np.percentile(y_proba, percentiles)
+    pct_str = ", ".join(f"p{p}={v:.3f}" for p, v in zip(percentiles, pct_vals))
+    logger.info(f"[MODEL]   Percentiles: {pct_str}")
 
     # Feature importance
     importance = dict(zip(available_features, xgb_model.feature_importances_))
@@ -254,8 +283,8 @@ def train_model(
             logger.info(f"[MODEL]   Dual optimal: {acc_dual:.4f} (n={dual_mask.sum()})")
             logger.info(f"[MODEL]   Non-dual: {acc_non:.4f} | Lift: {acc_dual - acc_non:+.4f}")
 
-    # Save model + platt scaler
-    _save_model(xgb_model, platt, available_features)
+    # Save model + calibrator
+    _save_model(xgb_model, calibrator, available_features)
 
     metrics = {
         "accuracy": round(accuracy, 4),
@@ -366,11 +395,11 @@ def tune_hyperparameters(
 # ---------------------------------------------------------------------------
 # Save / Load
 # ---------------------------------------------------------------------------
-def _save_model(model, platt, feature_columns: list):
-    """Save model + platt scaler + feature list to local disk and S3."""
+def _save_model(model, calibrator, feature_columns: list):
+    """Save model + isotonic calibrator + feature list to local disk and S3."""
     model_package = {
         "model": model,
-        "platt": platt,
+        "calibrator": calibrator,
         "features": feature_columns,
         "saved_at": datetime.utcnow().isoformat(),
     }
@@ -389,12 +418,14 @@ def _save_model(model, platt, feature_columns: list):
 
 
 def load_model() -> tuple:
-    """Load model from local disk or S3."""
+    """Load model + calibrator from local disk or S3."""
     if os.path.exists(LOCAL_MODEL_PATH):
         logger.info(f"[MODEL] Loading from local: {LOCAL_MODEL_PATH}")
         with open(LOCAL_MODEL_PATH, "rb") as f:
             package = pickle.load(f)
-        return package["model"], package.get("features")
+        # Support both old 'platt' key and new 'calibrator' key
+        calibrator = package.get("calibrator") or package.get("platt")
+        return package["model"], package.get("features"), calibrator
 
     try:
         bucket = os.environ.get("S3_BUCKET", "nfl-predictor-bucket")
@@ -403,7 +434,8 @@ def load_model() -> tuple:
         logger.info(f"[MODEL] Downloaded from S3: s3://{bucket}/{S3_MODEL_KEY}")
         with open(LOCAL_MODEL_PATH, "rb") as f:
             package = pickle.load(f)
-        return package["model"], package.get("features")
+        calibrator = package.get("calibrator") or package.get("platt")
+        return package["model"], package.get("features"), calibrator
     except Exception as e:
         logger.warning(f"[MODEL] No model found: {e}")
-        return None, None
+        return None, None, None

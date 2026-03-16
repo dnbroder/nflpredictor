@@ -29,7 +29,7 @@ try:
     from nfl_predictor.nfl_data import (
         load_games, load_drives, load_closing_lines,
         load_epa_by_game, load_qb_stats, load_plays,
-        load_players, load_snap_counts, CURRENT_SEASON,
+        load_players, CURRENT_SEASON,
     )
     logger.info("[BOOT] nfl_data OK")
 except Exception as e:
@@ -136,8 +136,10 @@ async def startup_event():
         result = load_model()
         model = result[0] if result else None
         features = result[1] if result and len(result) > 1 else None
+        calibrator = result[2] if result and len(result) > 2 else None
         if model is not None:
-            logger.info(f"[STARTUP] Model loaded OK — {len(features) if features else '?'} features")
+            cal_status = "with calibrator" if calibrator else "no calibrator"
+            logger.info(f"[STARTUP] Model loaded OK — {len(features) if features else '?'} features, {cal_status}")
         else:
             logger.warning("[STARTUP] No model found. Call POST /train before predicting.")
     except Exception as e:
@@ -303,16 +305,11 @@ def train_async(
             players = load_players(cache=True)
             logger.info(f"[ASYNC-TRAIN {job_id}] Players: {len(players)} records")
 
-            logger.info(f"[ASYNC-TRAIN {job_id}] Loading snap counts (history: {pic_seasons[0]}-{pic_seasons[-1]})...")
-            snaps = load_snap_counts(pic_seasons, cache=True)
-            logger.info(f"[ASYNC-TRAIN {job_id}] Snap counts: {len(snaps)} player-game rows")
-
             logger.info(f"[ASYNC-TRAIN {job_id}] Engineering features...")
             featured = engineer_features(
                 games, drives,
                 pbp_df=pbp,
                 players_df=players,
-                snap_df=snaps,
                 closing_lines_df=closing_lines,
                 epa_df=epa,
                 qb_df=qb,
@@ -539,11 +536,12 @@ def predict_week(
     logger.info(f"[PREDICT] week={week}, season={season}, min_confidence={min_confidence}")
     t0 = time.time()
     try:
-        model, feature_cols = load_model()
+        model, feature_cols, calibrator = load_model()
         if model is None:
             logger.warning("[PREDICT] No model available")
             return JSONResponse(status_code=404, content={"error": "No model. Run /train first."})
-        logger.info(f"[PREDICT] Model loaded ({len(feature_cols)} features)")
+        cal_status = "with calibrator" if calibrator else "raw probabilities"
+        logger.info(f"[PREDICT] Model loaded ({len(feature_cols)} features, {cal_status})")
 
         games = load_games([season])
         week_games = games[games["week"] == week]
@@ -566,8 +564,14 @@ def predict_week(
         X = featured[available]
         logger.info(f"[PREDICT] Predicting {len(X)} rows with {len(available)} features...")
 
-        y_proba = model.predict_proba(X)[:, 1]
-        y_pred = model.predict(X)
+        raw_proba = model.predict_proba(X)[:, 1]
+        if calibrator is not None:
+            y_proba = calibrator.predict(raw_proba)
+            logger.info(f"[PREDICT] Calibrated — raw mean={raw_proba.mean():.3f}, "
+                       f"calibrated mean={y_proba.mean():.3f}")
+        else:
+            y_proba = raw_proba
+        y_pred = (y_proba >= 0.5).astype(int)
         confidences = np.maximum(y_proba, 1 - y_proba)
 
         featured = featured.copy()
