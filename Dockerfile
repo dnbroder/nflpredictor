@@ -10,6 +10,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # pip upgrade also silences the "new release available" notice on every build
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    curl \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --upgrade pip --quiet --root-user-action=ignore
 
