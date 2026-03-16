@@ -93,6 +93,8 @@ PBP_COLS = [
     "two_point_attempt", "two_point_conv_result",
     "closing_spread_line",   # closing spread (Pro Football Reference)
     "closing_total_line",    # closing total (Pro Football Reference) — used as target
+    "offense_players",       # semicolon-delimited gsis_ids — Layer 3 PIC personnel
+    "defense_players",       # defensive personnel — Layer 3 opponent signal
 ]
 
 
@@ -392,54 +394,6 @@ def load_snap_counts(
     except Exception as e:
         logger.error(f"[DATA] load_snap_counts failed: {e}", exc_info=True)
         return pd.DataFrame()
-    """
-    Load player-level roster + snap count data.
-    Used for Layer 3 PIC computation.
-
-    Returns player-week records with:
-        player_id, player_name, team, position, position_group,
-        season, week, game_id, snap_count, snap_pct,
-        age, years_experience
-    """
-    seasons = seasons or list(range(2016, CURRENT_SEASON + 1))
-    cache_key = f"data/players/players_{min(seasons)}_{max(seasons)}.parquet"
-
-    if cache:
-        cached = _load_from_s3(cache_key)
-        if cached is not None:
-            return cached
-
-    logger.info(f"[DATA] Fetching player/roster data for {seasons}...")
-    try:
-        import nfl_data_py as nfl
-
-        # Rosters
-        rosters = nfl.import_weekly_rosters(seasons)
-
-        # Snap counts
-        try:
-            snaps = nfl.import_snap_counts(seasons)
-            players = rosters.merge(snaps, on=["player_id", "game_id", "season", "week"], how="left")
-        except Exception:
-            logger.warning("[DATA] Snap count import failed — using roster only")
-            players = rosters
-
-        # Compute age at time of game
-        if "birth_date" in players.columns and "gameday" in players.columns:
-            players["birth_date"] = pd.to_datetime(players["birth_date"], errors="coerce")
-            players["gameday"] = pd.to_datetime(players["gameday"], errors="coerce")
-            players["age"] = (
-                (players["gameday"] - players["birth_date"]).dt.days / 365.25
-            )
-
-        players = _add_position_groups(players)
-        logger.info(f"[DATA] Loaded {len(players)} player-game records")
-        if cache:
-            _save_to_s3(players, cache_key)
-        return players
-    except ImportError:
-        logger.error("[DATA] nfl_data_py not installed.")
-        raise
 
 
 def load_injuries(
