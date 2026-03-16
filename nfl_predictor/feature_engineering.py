@@ -88,6 +88,7 @@ FEATURE_COLUMNS = [
     "pic_cycle_confirmed",          # team dual_optimal AND qb_in_zone AND ol_sync >= 0.5
     "pic_cycle_degraded",           # team dual_optimal BUT backup QB (fade signal)
     "pic_alignment_score",          # continuous: team_alignment x (1 - is_backup)
+    "pic_avg_player_epa",           # avg career EPA percentile of players on field (quality signal)
     "pic_players_tracked",          # number of players with valid PIC cycles this game
     # Legacy stubs — kept for compatibility until retrain clears them
     "pic_composite_l1",

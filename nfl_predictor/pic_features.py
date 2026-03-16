@@ -95,6 +95,8 @@ def build_pic_features(
     Args:
         df:         Game-team rows from L1/L2 pipeline (1 row per team per game)
         pbp_df:     Play-by-play with offense_players, passer_player_id, etc.
+                    Should include full history (pic_history_start→train_end)
+                    for cold start resolution.
         players_df: Player identity table (gsis_id → position, pfr_id)
         snap_df:    Snap count data (pfr_id, game_id → offense_pct)
         logger:     Logger instance
@@ -113,6 +115,11 @@ def build_pic_features(
     if logger:
         logger.info("[PIC] Step 1: Building player identity and quality lookup...")
     player_lookup, snap_lookup = _build_player_lookups(players_df, snap_df, logger)
+
+    # Step 1b: Compute career EPA quality scores from full PBP history
+    if logger:
+        logger.info("[PIC] Step 1b: Computing career EPA quality scores...")
+    career_epa = _compute_career_epa(pbp_df, logger)
 
     # Step 2: Filter PBP to offensive possession plays only
     if logger:
@@ -133,7 +140,7 @@ def build_pic_features(
     if logger:
         logger.info("[PIC] Step 5: Building game-level PIC features...")
     game_pic = _build_game_pic_features(
-        drive_personnel, player_cycles, player_lookup, snap_lookup, logger
+        drive_personnel, player_cycles, player_lookup, snap_lookup, career_epa, logger
     )
 
     # Step 6: Merge onto game-team rows
@@ -198,8 +205,128 @@ def _build_player_lookups(
 
 
 # ---------------------------------------------------------------------------
-# Step 2: Filter to offensive possession plays
+# Step 1b: Career EPA quality scores
 # ---------------------------------------------------------------------------
+
+def _compute_career_epa(pbp_df: pd.DataFrame, logger=None) -> Dict:
+    """
+    Compute career EPA percentile rank per player from full PBP history.
+    Used as quality weight multiplier: Mahomes >> backup QB.
+
+    Returns dict: gsis_id → epa_percentile (0.0–1.0)
+    where 1.0 = top EPA player, 0.0 = worst.
+
+    Method:
+        - QB: career EPA/dropback from passer_player_id plays
+        - Skill (WR/TE/RB): career EPA/play from receiver/rusher plays
+        - OL: career snap-weighted team EPA (OL has no direct EPA attribution)
+          OL quality = team's average EPA/play when this player is on field
+
+    Only players with enough sample (min 50 plays) get a score.
+    Players without a score get median percentile (0.5) — neutral weight.
+    """
+    if pbp_df is None or len(pbp_df) == 0:
+        if logger:
+            logger.warning("[PIC]   Career EPA: empty PBP — skipping, all players get median weight")
+        return {}
+
+    t0 = time.time()
+    career_epa = {}
+
+    # QB EPA — from passer plays
+    if "passer_player_id" in pbp_df.columns and "epa" in pbp_df.columns:
+        qb_plays = pbp_df[
+            pbp_df["passer_player_id"].notna() &
+            pbp_df["epa"].notna()
+        ].copy()
+
+        qb_stats = (
+            qb_plays.groupby("passer_player_id")
+            .agg(epa_mean=("epa", "mean"), n_plays=("epa", "count"))
+            .reset_index()
+        )
+        qb_stats_filtered = qb_stats[qb_stats["n_plays"] >= 50]
+
+        if len(qb_stats_filtered) > 0:
+            qb_stats_filtered = qb_stats_filtered.copy()
+            qb_stats_filtered["epa_pct"] = qb_stats_filtered["epa_mean"].rank(pct=True)
+            for _, row in qb_stats_filtered.iterrows():
+                career_epa[row["passer_player_id"]] = float(row["epa_pct"])
+
+        if logger:
+            logger.info(f"[PIC]   QB EPA: {len(qb_stats)} passers found, "
+                       f"{len(qb_stats_filtered)} with ≥50 dropbacks scored")
+            if len(qb_stats_filtered) > 0:
+                top = qb_stats_filtered.nlargest(3, "epa_mean")[["passer_player_id","epa_mean","epa_pct"]]
+                for _, r in top.iterrows():
+                    logger.info(f"[PIC]     QB top: {r['passer_player_id']} "
+                               f"EPA/play={r['epa_mean']:.3f} pct={r['epa_pct']:.2f}")
+    else:
+        if logger:
+            logger.warning("[PIC]   Career EPA: passer_player_id or epa not in PBP columns — QB EPA skipped")
+
+    # Skill player EPA — receiver plays
+    if "receiver_player_id" in pbp_df.columns and "epa" in pbp_df.columns:
+        rec_plays = pbp_df[
+            pbp_df["receiver_player_id"].notna() &
+            pbp_df["epa"].notna()
+        ].copy()
+
+        rec_stats = (
+            rec_plays.groupby("receiver_player_id")
+            .agg(epa_mean=("epa", "mean"), n_plays=("epa", "count"))
+            .reset_index()
+        )
+        rec_stats_filtered = rec_stats[rec_stats["n_plays"] >= 30]
+
+        if len(rec_stats_filtered) > 0:
+            rec_stats_filtered = rec_stats_filtered.copy()
+            rec_stats_filtered["epa_pct"] = rec_stats_filtered["epa_mean"].rank(pct=True)
+            for _, row in rec_stats_filtered.iterrows():
+                gsis = row["receiver_player_id"]
+                existing = career_epa.get(gsis, 0.5)
+                career_epa[gsis] = max(existing, float(row["epa_pct"]))
+
+        if logger:
+            logger.info(f"[PIC]   Receiver EPA: {len(rec_stats)} receivers found, "
+                       f"{len(rec_stats_filtered)} with ≥30 targets scored")
+
+    # Rusher EPA
+    if "rusher_player_id" in pbp_df.columns and "epa" in pbp_df.columns:
+        rush_plays = pbp_df[
+            pbp_df["rusher_player_id"].notna() &
+            pbp_df["epa"].notna()
+        ].copy()
+
+        rush_stats = (
+            rush_plays.groupby("rusher_player_id")
+            .agg(epa_mean=("epa", "mean"), n_plays=("epa", "count"))
+            .reset_index()
+        )
+        rush_stats_filtered = rush_stats[rush_stats["n_plays"] >= 30]
+
+        if len(rush_stats_filtered) > 0:
+            rush_stats_filtered = rush_stats_filtered.copy()
+            rush_stats_filtered["epa_pct"] = rush_stats_filtered["epa_mean"].rank(pct=True)
+            for _, row in rush_stats_filtered.iterrows():
+                gsis = row["rusher_player_id"]
+                existing = career_epa.get(gsis, 0.5)
+                career_epa[gsis] = max(existing, float(row["epa_pct"]))
+
+        if logger:
+            logger.info(f"[PIC]   Rusher EPA: {len(rush_stats)} rushers found, "
+                       f"{len(rush_stats_filtered)} with ≥30 carries scored")
+
+    if logger:
+        logger.info(f"[PIC]   Career EPA scores: {len(career_epa)} players in {time.time()-t0:.1f}s")
+        if career_epa:
+            scores = list(career_epa.values())
+            logger.info(f"[PIC]   EPA percentile range: {min(scores):.2f}–{max(scores):.2f}, "
+                       f"median={sorted(scores)[len(scores)//2]:.2f}")
+            # Count players without EPA scores (will get 0.5 default)
+            logger.info(f"[PIC]   Players without EPA score get median weight (0.5)")
+
+    return career_epa
 
 def _filter_offensive_plays(pbp_df: pd.DataFrame, logger=None) -> pd.DataFrame:
     """
@@ -426,6 +553,11 @@ def _compute_player_pic_cycles(
 
     if logger:
         logger.info(f"[PIC]   Computing PIC cycles for {len(player_drives)} players...")
+        # Log breakdown of players with enough drives vs dropped
+        enough = sum(1 for drives in player_drives.values() if len(drives) >= MIN_DRIVES_FOR_BASELINE)
+        too_few = len(player_drives) - enough
+        logger.info(f"[PIC]   Players with ≥{MIN_DRIVES_FOR_BASELINE} drives: {enough} | "
+                   f"dropped (too few drives): {too_few}")
 
     # For each player, sort drives chronologically and compute cycle state
     player_cycles = {}
@@ -480,6 +612,15 @@ def _compute_player_pic_cycles(
     if logger:
         logger.info(f"[PIC]   PIC cycles computed for {len(player_cycles)} players "
                     f"(min {MIN_DRIVES_FOR_BASELINE} drives required)")
+        if player_cycles:
+            total_drives_list = [v["total_drives"] for v in player_cycles.values()]
+            scoring_rates = [v["career_scoring_rate"] for v in player_cycles.values()]
+            logger.info(f"[PIC]   Avg drives per player: {np.mean(total_drives_list):.0f} "
+                       f"(min={min(total_drives_list)}, max={max(total_drives_list)})")
+            logger.info(f"[PIC]   Career scoring rate distribution: "
+                       f"mean={np.mean(scoring_rates):.3f}, "
+                       f"min={min(scoring_rates):.3f}, "
+                       f"max={max(scoring_rates):.3f}")
 
     return player_cycles
 
@@ -539,6 +680,7 @@ def _build_game_pic_features(
     player_cycles: Dict,
     player_lookup: Dict,
     snap_lookup: Dict,
+    career_epa: Dict,
     logger=None,
 ) -> pd.DataFrame:
     """
@@ -580,6 +722,7 @@ def _build_game_pic_features(
             all_game_players.update(drive["all_players"])
 
         # For each player, get their cycle state from PREVIOUS game
+        epa_scores = []
         qb_zone = np.nan
         qb_career_rate = np.nan
         qb_is_backup = 0
@@ -637,8 +780,14 @@ def _build_game_pic_features(
             if np.isnan(l1_zone):
                 continue
 
-            # Quality weight = position weight × snap percentage
-            quality_weight = weight * snap_pct
+            # Quality weight = position weight × snap percentage × career EPA percentile
+            # This is the key distinction: Mahomes at 0.95 EPA percentile gets
+            # 3x the quality weight of a backup at 0.3 EPA percentile.
+            # OL players without direct EPA attribution get 0.5 (median) as default.
+            epa_pct = career_epa.get(gsis, 0.5)  # default to median if unknown
+            quality_weight = weight * snap_pct * (0.5 + epa_pct)  # scale: 0.5x to 1.5x
+
+            epa_scores.append(epa_pct)
 
             if pos in {"OT", "T", "G", "C", "OL"}:
                 ol_zones.append(l1_zone)
@@ -668,6 +817,7 @@ def _build_game_pic_features(
             "pic_skill_sync_rate":    pic_skill_sync_rate,
             "pic_team_alignment":     pic_team_alignment,
             "pic_present_quality":    pic_present_quality,
+            "pic_avg_player_epa":     float(np.mean(epa_scores)) if epa_scores else np.nan,
             "pic_players_tracked":    len(all_zones),
         })
 
@@ -675,10 +825,25 @@ def _build_game_pic_features(
 
     if logger:
         logger.info(f"[PIC]   Game PIC features: {len(df)} team-game rows")
-        for col in ["pic_qb_in_zone", "pic_ol_sync_rate", "pic_team_alignment"]:
+        for col in ["pic_qb_in_zone", "pic_ol_sync_rate", "pic_team_alignment",
+                    "pic_skill_sync_rate", "pic_present_quality", "pic_avg_player_epa"]:
             if col in df.columns:
                 valid = df[col].notna().sum()
-                logger.info(f"[PIC]     {col}: {valid}/{len(df)} valid ({valid/len(df)*100:.0f}%)")
+                pct = valid / len(df) * 100 if len(df) > 0 else 0
+                if valid > 0:
+                    mean_val = df[col].dropna().mean()
+                    logger.info(f"[PIC]     {col}: {valid}/{len(df)} valid ({pct:.0f}%) mean={mean_val:.3f}")
+                else:
+                    logger.warning(f"[PIC]     {col}: 0/{len(df)} valid — no data")
+        # Log backup QB coverage
+        if "pic_qb_is_backup" in df.columns:
+            n_backup = (df["pic_qb_is_backup"] == 1).sum()
+            logger.info(f"[PIC]     Backup QB games detected: {n_backup} ({n_backup/len(df)*100:.1f}%)")
+        # Log EPA weight coverage
+        n_epa_scored = sum(1 for r in records if not np.isnan(r.get("pic_avg_player_epa", np.nan)))
+        n_epa_default = len(records) - n_epa_scored
+        logger.info(f"[PIC]     Games with EPA-weighted quality: {n_epa_scored} | "
+                   f"using default weight: {n_epa_default}")
 
     return df
 

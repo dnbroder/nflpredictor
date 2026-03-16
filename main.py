@@ -249,18 +249,28 @@ def train(
 
 @app.post("/train-async")
 def train_async(
-    train_start: int = Query(default=2016),
+    train_start: int = Query(default=2020),
     train_end: int = Query(default=2022),
+    pic_history_start: int = Query(default=2016),
 ):
-    """Train model in background thread. Returns immediately."""
+    """
+    Train model in background thread. Returns immediately.
+
+    pic_history_start: earliest season for PIC cycle history (default 2016).
+    Player cycle baselines are computed from pic_history_start→train_end,
+    but the feature matrix only includes train_start→train_end rows.
+    This solves the cold start problem — players have deep cycle history
+    even when training on fewer seasons.
+    """
     job_id = str(uuid.uuid4())[:8]
 
     def _run():
         t0 = time.time()
         logger.info(f"[ASYNC-TRAIN {job_id}] ========================================")
-        logger.info(f"[ASYNC-TRAIN {job_id}] train_start={train_start}, train_end={train_end}")
+        logger.info(f"[ASYNC-TRAIN {job_id}] train_start={train_start}, train_end={train_end}, pic_history_start={pic_history_start}")
         try:
             seasons = list(range(train_start, train_end + 1))
+            pic_seasons = list(range(pic_history_start, train_end + 1))
 
             logger.info(f"[ASYNC-TRAIN {job_id}] Loading games for {seasons}...")
             games = load_games(seasons)
@@ -282,16 +292,19 @@ def train_async(
             qb = load_qb_stats(seasons)
             logger.info(f"[ASYNC-TRAIN {job_id}] QB stats: {len(qb)} team-game rows")
 
-            logger.info(f"[ASYNC-TRAIN {job_id}] Loading PBP for Layer 3 PIC...")
-            pbp = load_plays(seasons, cache=True)
-            logger.info(f"[ASYNC-TRAIN {job_id}] PBP: {len(pbp)} plays")
+            # PBP for PIC uses extended history (pic_history_start) to solve cold start.
+            # Players need 8+ drives of history — using full history means Week 1 of
+            # 2020 has cycle baselines from 2016-2019 rather than starting from scratch.
+            logger.info(f"[ASYNC-TRAIN {job_id}] Loading PBP for Layer 3 PIC (history: {pic_seasons[0]}-{pic_seasons[-1]})...")
+            pbp = load_plays(pic_seasons, cache=True)
+            logger.info(f"[ASYNC-TRAIN {job_id}] PBP: {len(pbp)} plays ({len(pic_seasons)} seasons of history)")
 
             logger.info(f"[ASYNC-TRAIN {job_id}] Loading player identity...")
             players = load_players(cache=True)
             logger.info(f"[ASYNC-TRAIN {job_id}] Players: {len(players)} records")
 
-            logger.info(f"[ASYNC-TRAIN {job_id}] Loading snap counts...")
-            snaps = load_snap_counts(seasons, cache=True)
+            logger.info(f"[ASYNC-TRAIN {job_id}] Loading snap counts (history: {pic_seasons[0]}-{pic_seasons[-1]})...")
+            snaps = load_snap_counts(pic_seasons, cache=True)
             logger.info(f"[ASYNC-TRAIN {job_id}] Snap counts: {len(snaps)} player-game rows")
 
             logger.info(f"[ASYNC-TRAIN {job_id}] Engineering features...")
