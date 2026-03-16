@@ -308,9 +308,90 @@ def load_plays(
 
 
 def load_players(
+    cache: bool = True,
+) -> pd.DataFrame:
+    """
+    Load player identity table — gsis_id, position, pfr_id, display_name.
+    Used as the Rosetta Stone for joining PBP offense_players to snap counts.
+    Static data — rarely changes, aggressive caching appropriate.
+    """
+    cache_key = "data/players/players_identity.parquet"
+    t0 = time.time()
+
+    if cache:
+        cached = _load_from_s3(cache_key)
+        if cached is not None:
+            logger.info(f"[DATA] Players S3 cache HIT: {len(cached)} players in {time.time()-t0:.1f}s")
+            return cached
+
+    try:
+        import nfl_data_py as nfl
+        logger.info("[DATA] Fetching player identity table...")
+        df = nfl.import_players()
+        logger.info(f"[DATA] Players: {len(df)} rows, {df['position'].nunique()} positions")
+
+        # Keep only columns needed for L3 join
+        keep = [c for c in [
+            "gsis_id", "display_name", "position", "pfr_id",
+            "first_name", "last_name", "status",
+            "draft_year", "draft_round", "draft_pick",
+            "years_of_experience", "latest_team",
+        ] if c in df.columns]
+        df = df[keep].copy()
+        df = df[df["gsis_id"].notna()].copy()
+
+        if cache:
+            _save_to_s3(df, cache_key)
+        return df
+
+    except Exception as e:
+        logger.error(f"[DATA] load_players failed: {e}", exc_info=True)
+        return pd.DataFrame()
+
+
+def load_snap_counts(
     seasons: List[int] = None,
     cache: bool = True,
 ) -> pd.DataFrame:
+    """
+    Load snap count data per player per game.
+    Used in Layer 3 PIC to weight player cycle contributions by usage.
+
+    A player at 5% snaps is essentially absent from the cycle.
+    A player at 100% snaps is the dominant signal for that position group.
+
+    Returns: game_id, pfr_player_id, player, position, team,
+             offense_snaps, offense_pct, defense_snaps, defense_pct
+    """
+    seasons = seasons or list(range(2020, CURRENT_SEASON + 1))
+    cache_key = f"data/snaps/snap_counts_{min(seasons)}_{max(seasons)}.parquet"
+    t0 = time.time()
+
+    logger.info(f"[DATA] load_snap_counts: seasons={seasons}")
+
+    if cache:
+        cached = _load_from_s3(cache_key)
+        if cached is not None:
+            logger.info(f"[DATA] Snap counts S3 cache HIT: {len(cached)} rows in {time.time()-t0:.1f}s")
+            return cached
+
+    try:
+        import nfl_data_py as nfl
+        logger.info(f"[DATA] Fetching snap counts for {seasons}...")
+        df = nfl.import_snap_counts(seasons)
+        logger.info(f"[DATA] Snap counts: {len(df)} player-game rows")
+
+        # Audit coverage
+        pct_valid = df["offense_pct"].notna().sum() / len(df) * 100
+        logger.info(f"[DATA]   offense_pct valid: {pct_valid:.0f}%")
+
+        if cache:
+            _save_to_s3(df, cache_key)
+        return df
+
+    except Exception as e:
+        logger.error(f"[DATA] load_snap_counts failed: {e}", exc_info=True)
+        return pd.DataFrame()
     """
     Load player-level roster + snap count data.
     Used for Layer 3 PIC computation.

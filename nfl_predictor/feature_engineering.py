@@ -76,14 +76,27 @@ FEATURE_COLUMNS = [
     "p2s_p2sz_signal_strength",     # sum of L1 ratio + L2 ratio (continuous)
     "matchup_dual_optimal",         # 1 if this team dual optimal AND opp defense suppressed
 
-    # ── Layer 3: PIC — Player Impact Curve (Phase 3) ────────────────────
-    "pic_composite_l1",             # roster composite PIC_L1
-    "pic_composite_l2",             # roster composite PIC_L2
-    "pic_lineup_delta_l1",          # L1 impact change from this week's roster changes
-    "pic_lineup_delta_l2",          # L2 impact change from this week's roster changes
-    "pic_key_player_active",        # top-3 PIC players active
-    "pic_ol_composite",             # OL PIC_L2 composite
-    "pic_pass_rush_opp",            # opponent pass rush PIC_L1 suppression
+    # ── Layer 3: PIC — Player Impact Curve ──────────────────────────────
+    "pic_qb_in_zone",               # QB personally in L1 optimal zone pre-game
+    "pic_qb_career_rate",           # QB career scoring drive rate (quality baseline)
+    "pic_qb_is_backup",             # 1 if backup QB detected this game
+    "pic_ol_sync_rate",             # % of OL players in their personal L1 optimal zone
+    "pic_ol_quality_weighted",      # snap_pct x position_weight OL composite
+    "pic_skill_sync_rate",          # % of skill players in their personal L1 optimal zone
+    "pic_team_alignment",           # weighted avg of all player zone states (core signal)
+    "pic_present_quality",          # quality score of players who ARE present
+    "pic_cycle_confirmed",          # team dual_optimal AND qb_in_zone AND ol_sync >= 0.5
+    "pic_cycle_degraded",           # team dual_optimal BUT backup QB (fade signal)
+    "pic_alignment_score",          # continuous: team_alignment x (1 - is_backup)
+    "pic_players_tracked",          # number of players with valid PIC cycles this game
+    # Legacy stubs — kept for compatibility until retrain clears them
+    "pic_composite_l1",
+    "pic_composite_l2",
+    "pic_lineup_delta_l1",
+    "pic_lineup_delta_l2",
+    "pic_key_player_active",
+    "pic_ol_composite",
+    "pic_pass_rush_opp",
 
     # ── Layer 4: PIM — Personal Impact Measurement (Phase 4) ────────────
     "pim_trajectory",               # PIM-adjusted trajectory composite
@@ -126,6 +139,7 @@ def engineer_features(
     drives_df: pd.DataFrame,
     pbp_df: pd.DataFrame = None,
     players_df: pd.DataFrame = None,
+    snap_df: pd.DataFrame = None,
     contracts_df: pd.DataFrame = None,
     closing_lines_df: pd.DataFrame = None,
     epa_df: pd.DataFrame = None,
@@ -184,10 +198,24 @@ def engineer_features(
     logger.info("[FEAT] Step 7: Merging QB features...")
     df = _build_qb_features(df, qb_df)
 
-    # Step 6b: Layer 3 (stub — Phase 3)
-    for col in [c for c in FEATURE_COLUMNS if c.startswith("pic_")]:
-        if col not in df.columns:
-            df[col] = np.nan
+    # Step 6b: Layer 3 — PIC Player Impact Curve
+    logger.info("[FEAT] Step 6b: Building PIC features (Layer 3)...")
+    t6b = time.time()
+    if pbp_df is not None and players_df is not None and snap_df is not None:
+        try:
+            from nfl_predictor.pic_features import build_pic_features
+            df = build_pic_features(df, pbp_df, players_df, snap_df, logger=logger)
+            logger.info(f"[FEAT]   Step 6b done in {time.time()-t6b:.1f}s")
+        except Exception as e:
+            logger.warning(f"[FEAT]   PIC build failed (non-fatal): {e} — filling stubs")
+            for col in [c for c in FEATURE_COLUMNS if c.startswith("pic_")]:
+                if col not in df.columns:
+                    df[col] = np.nan
+    else:
+        logger.warning("[FEAT]   PIC skipped — pbp_df, players_df or snap_df not provided")
+        for col in [c for c in FEATURE_COLUMNS if c.startswith("pic_")]:
+            if col not in df.columns:
+                df[col] = np.nan
 
     # Step 7b: Layer 4 (stub — Phase 4)
     for col in [c for c in FEATURE_COLUMNS if c.startswith("pim_")]:

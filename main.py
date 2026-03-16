@@ -28,7 +28,8 @@ logger.info("[BOOT] Importing nfl_predictor modules...")
 try:
     from nfl_predictor.nfl_data import (
         load_games, load_drives, load_closing_lines,
-        load_epa_by_game, load_qb_stats, CURRENT_SEASON,
+        load_epa_by_game, load_qb_stats, load_plays,
+        load_players, load_snap_counts, CURRENT_SEASON,
     )
     logger.info("[BOOT] nfl_data OK")
 except Exception as e:
@@ -281,8 +282,28 @@ def train_async(
             qb = load_qb_stats(seasons)
             logger.info(f"[ASYNC-TRAIN {job_id}] QB stats: {len(qb)} team-game rows")
 
+            logger.info(f"[ASYNC-TRAIN {job_id}] Loading PBP for Layer 3 PIC...")
+            pbp = load_plays(seasons, cache=True)
+            logger.info(f"[ASYNC-TRAIN {job_id}] PBP: {len(pbp)} plays")
+
+            logger.info(f"[ASYNC-TRAIN {job_id}] Loading player identity...")
+            players = load_players(cache=True)
+            logger.info(f"[ASYNC-TRAIN {job_id}] Players: {len(players)} records")
+
+            logger.info(f"[ASYNC-TRAIN {job_id}] Loading snap counts...")
+            snaps = load_snap_counts(seasons, cache=True)
+            logger.info(f"[ASYNC-TRAIN {job_id}] Snap counts: {len(snaps)} player-game rows")
+
             logger.info(f"[ASYNC-TRAIN {job_id}] Engineering features...")
-            featured = engineer_features(games, drives, closing_lines_df=closing_lines, epa_df=epa, qb_df=qb)
+            featured = engineer_features(
+                games, drives,
+                pbp_df=pbp,
+                players_df=players,
+                snap_df=snaps,
+                closing_lines_df=closing_lines,
+                epa_df=epa,
+                qb_df=qb,
+            )
             logger.info(f"[ASYNC-TRAIN {job_id}] Features: {len(featured)} rows")
 
             # Diagnostic: verify closing_total survived the full pipeline before hitting model
