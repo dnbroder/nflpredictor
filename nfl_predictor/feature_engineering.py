@@ -99,7 +99,19 @@ FEATURE_COLUMNS = [
     "pic_ol_composite",
     "pic_pass_rush_opp",
 
-    # ── Layer 4: PIM — Personal Impact Measurement (Phase 4) ────────────
+    # ── Layer 4: PIM — Q1 Pace Signal (historical confirmation) ─────────
+    # Q1 pace = combined Q1 score / closing_total.
+    # Threshold: >=25% → over rate 69-82%. <=10% → over rate 25%.
+    # These are historical features computed from PBP at training time.
+    # They encode the market calibration signal: high Q1 pace = market
+    # underpriced the game. Low Q1 pace = market overpriced it.
+    "pim_q1_pct_of_total",          # q1_combined / closing_total (team's game)
+    "pim_q1_epa_per_drive",         # avg EPA per Q1 drive (efficiency signal)
+    "pim_q1_scoring_drives",        # number of scoring drives in Q1
+    "pim_q1_cycle_confirmed",       # 1 if dual_optimal AND q1_pct >= 0.20
+    "pim_q1_cycle_contradicted",    # 1 if dual_optimal AND q1_pct <= 0.10
+    "pim_h1_pct_of_total",          # h1_combined / closing_total (halftime pace)
+    # Legacy PIM stubs (Phase 4 — not yet implemented)
     "pim_trajectory",               # PIM-adjusted trajectory composite
     "pim_salary_signal",            # salary arbitrage revealed-preference signal
     "pim_volatility",               # roster reliability (lower = better)
@@ -217,7 +229,15 @@ def engineer_features(
             if col not in df.columns:
                 df[col] = np.nan
 
-    # Step 7b: Layer 4 (stub — Phase 4)
+    # Step 7b: Layer 4 — Q1 Pace Signal (PIM)
+    t7b = time.time()
+    if pbp_df is not None:
+        try:
+            df = _build_q1_pace_features(df, pbp_df, logger=logger)
+            logger.info(f"[FEAT]   Step 7b (Q1 pace) done in {time.time()-t7b:.1f}s")
+        except Exception as e:
+            logger.warning(f"[FEAT]   Q1 pace build failed (non-fatal): {e}")
+    # Fill any remaining PIM stubs
     for col in [c for c in FEATURE_COLUMNS if c.startswith("pim_")]:
         if col not in df.columns:
             df[col] = np.nan
@@ -1019,5 +1039,203 @@ def _validate_and_clean(df: pd.DataFrame) -> pd.DataFrame:
             logger.info(f"[FEAT]     Overall {TARGET_COLUMN} rate: {target_rate_overall:.3f}")
             logger.info(f"[FEAT]     Dual optimal {TARGET_COLUMN} rate: {target_rate_dual:.3f}")
             logger.info(f"[FEAT]     Lift: {(target_rate_dual - target_rate_overall):.3f} ({(target_rate_dual/target_rate_overall - 1)*100:+.1f}%)")
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Layer 4: Q1 Pace Signal (PIM — Player Impact Momentum)
+# ---------------------------------------------------------------------------
+
+def _build_q1_pace_features(
+    df: pd.DataFrame,
+    pbp_df: pd.DataFrame,
+    logger=None,
+) -> pd.DataFrame:
+    """
+    Compute Q1 and H1 pace signals from play-by-play and merge onto game-team rows.
+
+    The core insight (validated on 887 games, 2016-2019 SBR data):
+      Q1 pace = combined Q1 score / closing_total
+      - Q1 pct <= 10% → over rate 25% (strong under signal)
+      - Q1 pct >= 25% → over rate 69-82% (strong over signal)
+      - H1 pct <  30% → over rate 11% (near-certain under)
+      - H1 pct >= 80% → over rate 100% (56/56 games)
+
+    These are historical features — Q1 data from the game BEING PREDICTED
+    is used at training time. At inference time this is a live signal
+    (read after Q1 ends). The model learns the historical correlation.
+
+    Features added (per team-game row):
+      pim_q1_pct_of_total     - game's combined Q1 score / closing_total
+      pim_q1_epa_per_drive    - avg EPA per Q1 drive for this team
+      pim_q1_scoring_drives   - number of scoring drives in Q1 for this team
+      pim_q1_cycle_confirmed  - 1 if dual_optimal AND q1_pct >= 0.20
+      pim_q1_cycle_contradicted - 1 if dual_optimal AND q1_pct <= 0.10
+      pim_h1_pct_of_total     - game's combined H1 score / closing_total
+    """
+    if pbp_df is None or len(pbp_df) == 0:
+        return df
+
+    required = {"qtr", "game_id", "total_home_score", "total_away_score"}
+    if not required.issubset(pbp_df.columns):
+        if logger:
+            missing = required - set(pbp_df.columns)
+            logger.warning(f"[PIM]   Q1 pace skipped — missing PBP columns: {missing}")
+        return df
+
+    if logger:
+        logger.info("[PIM] Computing Q1/H1 pace features...")
+
+    # ── Game-level Q1 combined score ─────────────────────────────────────────
+    # Use last play of Q1 per game — total_home_score + total_away_score
+    q1_plays = pbp_df[pbp_df["qtr"] == 1].copy()
+    h1_plays = pbp_df[pbp_df["qtr"].isin([1, 2])].copy()
+
+    def get_combined_at_end(plays):
+        if len(plays) == 0:
+            return pd.DataFrame(columns=["game_id", "combined"])
+        last = plays.groupby("game_id").last()[
+            ["total_home_score", "total_away_score"]
+        ].reset_index()
+        last["combined"] = last["total_home_score"] + last["total_away_score"]
+        return last[["game_id", "combined"]]
+
+    q1_combined = get_combined_at_end(q1_plays).rename(columns={"combined": "q1_combined"})
+    h1_combined = get_combined_at_end(h1_plays).rename(columns={"combined": "h1_combined"})
+
+    # ── Team-level Q1 EPA and drive stats ────────────────────────────────────
+    if "epa" in q1_plays.columns and "posteam" in q1_plays.columns:
+        # EPA per drive per team in Q1
+        q1_drive_epa = (
+            q1_plays[q1_plays["epa"].notna()]
+            .groupby(["game_id", "posteam", "fixed_drive"])["epa"]
+            .sum()
+            .reset_index()
+            .groupby(["game_id", "posteam"])["epa"]
+            .mean()
+            .reset_index()
+            .rename(columns={"epa": "pim_q1_epa_per_drive", "posteam": "team"})
+        )
+    else:
+        q1_drive_epa = None
+
+    # Scoring drives in Q1 per team
+    if "fixed_drive_result" in q1_plays.columns and "posteam" in q1_plays.columns:
+        q1_last_play = q1_plays.groupby(
+            ["game_id", "posteam", "fixed_drive"]
+        ).last().reset_index()
+        q1_last_play["is_scoring"] = q1_last_play["fixed_drive_result"].isin(
+            ["Touchdown", "Field goal"]
+        ).astype(int)
+        q1_scoring = (
+            q1_last_play.groupby(["game_id", "posteam"])["is_scoring"]
+            .sum()
+            .reset_index()
+            .rename(columns={"is_scoring": "pim_q1_scoring_drives", "posteam": "team"})
+        )
+    else:
+        q1_scoring = None
+
+    # ── Merge game-level Q1/H1 pace onto df ──────────────────────────────────
+    df = df.merge(q1_combined, on="game_id", how="left")
+    df = df.merge(h1_combined, on="game_id", how="left")
+
+    # Compute pace as fraction of closing_total
+    if "closing_total" in df.columns:
+        df["pim_q1_pct_of_total"] = df["q1_combined"] / df["closing_total"].replace(0, np.nan)
+        df["pim_h1_pct_of_total"] = df["h1_combined"] / df["closing_total"].replace(0, np.nan)
+    else:
+        df["pim_q1_pct_of_total"] = np.nan
+        df["pim_h1_pct_of_total"] = np.nan
+
+    df.drop(columns=["q1_combined", "h1_combined"], inplace=True, errors="ignore")
+
+    # ── Merge team-level Q1 stats ─────────────────────────────────────────────
+    if q1_drive_epa is not None:
+        df = df.merge(
+            q1_drive_epa,
+            left_on=["game_id", "team"],
+            right_on=["game_id", "team"],
+            how="left"
+        )
+    else:
+        df["pim_q1_epa_per_drive"] = np.nan
+
+    if q1_scoring is not None:
+        df = df.merge(
+            q1_scoring,
+            left_on=["game_id", "team"],
+            right_on=["game_id", "team"],
+            how="left"
+        )
+    else:
+        df["pim_q1_scoring_drives"] = np.nan
+
+    # ── Cycle × Q1 multiplicative interaction ────────────────────────────────
+    # This is the lighthouse signal: pre-game cycle prediction confirmed or
+    # contradicted by Q1 pace. When both point the same direction, edge is
+    # dramatically larger than either signal alone.
+    #
+    # Dual optimal = team in L1+L2 scoring cycle alignment pre-game
+    # Q1 confirmed = pace >= 20% (game on track to go over)
+    # Q1 contradicted = pace <= 10% (game tracking under)
+    #
+    # Historical pattern: dual_optimal + Q1 confirmed → ~75%+ over rate
+    #                     dual_optimal + Q1 contradicted → ~20% over rate
+    if "p2s_p2sz_dual_optimal" in df.columns:
+        dual = (df["p2s_p2sz_dual_optimal"] == 1.0)
+        q1_over_pace = (df["pim_q1_pct_of_total"] >= 0.20)
+        q1_under_pace = (df["pim_q1_pct_of_total"] <= 0.10)
+
+        df["pim_q1_cycle_confirmed"] = (dual & q1_over_pace).astype(float)
+        df["pim_q1_cycle_contradicted"] = (dual & q1_under_pace).astype(float)
+
+        # Set to NaN where Q1 pace is missing (no PBP data for that game)
+        q1_missing = df["pim_q1_pct_of_total"].isna()
+        df.loc[q1_missing, "pim_q1_cycle_confirmed"] = np.nan
+        df.loc[q1_missing, "pim_q1_cycle_contradicted"] = np.nan
+    else:
+        df["pim_q1_cycle_confirmed"] = np.nan
+        df["pim_q1_cycle_contradicted"] = np.nan
+
+    # ── Logging ──────────────────────────────────────────────────────────────
+    if logger:
+        n_valid = df["pim_q1_pct_of_total"].notna().sum()
+        n_total = len(df)
+        logger.info(f"[PIM]   Q1 pace: {n_valid}/{n_total} games have Q1 data")
+        if n_valid > 0:
+            q1 = df["pim_q1_pct_of_total"].dropna()
+            logger.info(
+                f"[PIM]   Q1 pct distribution: "
+                f"mean={q1.mean():.3f}, "
+                f"p25={q1.quantile(0.25):.3f}, "
+                f"p50={q1.quantile(0.50):.3f}, "
+                f"p75={q1.quantile(0.75):.3f}"
+            )
+            # Diagnostic: over rate by Q1 bucket
+            if "over_total" in df.columns:
+                buckets = [0, 0.10, 0.20, 0.25, 0.30, 1.0]
+                labels = ["<=10%", "10-20%", "20-25%", "25-30%", ">30%"]
+                df["_q1_bucket"] = pd.cut(
+                    df["pim_q1_pct_of_total"], bins=buckets, labels=labels
+                )
+                bucket_stats = df.groupby("_q1_bucket")["over_total"].agg(["mean", "count"])
+                logger.info("[PIM]   Q1 pace → over rate (training set):")
+                for label, row in bucket_stats.iterrows():
+                    if row["count"] >= 10:
+                        logger.info(
+                            f"[PIM]     {label}: {row['mean']*100:.1f}% over "
+                            f"(n={int(row['count'])})"
+                        )
+                df.drop(columns=["_q1_bucket"], inplace=True, errors="ignore")
+
+        # Cycle confirmation diagnostic
+        n_confirmed = df["pim_q1_cycle_confirmed"].sum()
+        n_contradicted = df["pim_q1_cycle_contradicted"].sum()
+        logger.info(
+            f"[PIM]   Cycle+Q1 confirmed: {n_confirmed:.0f} games | "
+            f"contradicted: {n_contradicted:.0f} games"
+        )
 
     return df

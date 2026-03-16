@@ -467,11 +467,36 @@ def _aggregate_drive_personnel(
 
     Returns one row per (game_id, posteam, fixed_drive).
     """
+    # ── Garbage time constants ─────────────────────────────────────────────────
+    # Q4 drives with differential > 20 are excluded from cycle computation.
+    # These reflect prevent defense, clock kill, and desperation offense —
+    # none of which represent a team's actual scoring cycle state.
+    # Q1-Q3 drives always included. Q4 ≤ 20 differential = competitive, included.
+    GARBAGE_TIME_DIFF = 20
+    GARBAGE_TIME_QUARTER = 4
+
     records = []
+    garbage_time_excluded = 0
 
     for (game_id, posteam, drive_id), plays in pbp_off.groupby(
         ["game_id", "posteam", "fixed_drive"]
     ):
+        # ── Garbage time filter ──────────────────────────────────────────────
+        drive_quarter = int(plays["qtr"].iloc[0]) if "qtr" in plays.columns else 1
+        if drive_quarter >= GARBAGE_TIME_QUARTER:
+            if "score_differential" in plays.columns:
+                diff_at_start = abs(float(plays["score_differential"].iloc[0]))
+            elif "posteam_score" in plays.columns and "defteam_score" in plays.columns:
+                diff_at_start = abs(
+                    float(plays["posteam_score"].iloc[0]) -
+                    float(plays["defteam_score"].iloc[0])
+                )
+            else:
+                diff_at_start = 0  # unknown, include
+            if diff_at_start > GARBAGE_TIME_DIFF:
+                garbage_time_excluded += 1
+                continue
+
         # Collect all personnel sets across plays in this drive
         play_personnel = []
         for _, play in plays.iterrows():
@@ -567,6 +592,8 @@ def _aggregate_drive_personnel(
             logger.info(f"[PIC]   Backup QB drives: {backup_pct:.1f}%")
             scoring_pct = df["is_scoring_drive"].mean() * 100
             logger.info(f"[PIC]   Scoring drive rate: {scoring_pct:.1f}%")
+            logger.info(f"[PIC]   Garbage time drives excluded: {garbage_time_excluded} "
+                       f"(Q4 differential > 20)")
 
     return df
 
