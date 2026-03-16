@@ -114,7 +114,7 @@ def build_pic_features(
     # Step 1: Build player identity + quality lookup
     if logger:
         logger.info("[PIC] Step 1: Building player identity and quality lookup...")
-    player_lookup, snap_lookup = _build_player_lookups(players_df, snap_df, logger)
+    player_lookup, snap_lookup, snap_lookup_by_gsis = _build_player_lookups(players_df, snap_df, logger)
 
     # Step 1b: Compute career EPA quality scores from full PBP history
     if logger:
@@ -129,7 +129,7 @@ def build_pic_features(
     # Step 3: Aggregate drive personnel — base group + key player presence
     if logger:
         logger.info("[PIC] Step 3: Aggregating drive-level personnel...")
-    drive_personnel = _aggregate_drive_personnel(pbp_off, player_lookup, snap_lookup, logger)
+    drive_personnel = _aggregate_drive_personnel(pbp_off, player_lookup, snap_lookup, snap_lookup_by_gsis, logger)
 
     # Step 4: Compute per-player PIC cycles from drive history
     if logger:
@@ -140,7 +140,7 @@ def build_pic_features(
     if logger:
         logger.info("[PIC] Step 5: Building game-level PIC features...")
     game_pic = _build_game_pic_features(
-        drive_personnel, player_cycles, player_lookup, snap_lookup, career_epa, logger
+        drive_personnel, player_cycles, player_lookup, snap_lookup, snap_lookup_by_gsis, career_epa, logger
     )
 
     # Step 6: Merge onto game-team rows
@@ -188,6 +188,7 @@ def _build_player_lookups(
         logger.info(f"[PIC]   Player lookup: {len(player_lookup)} offensive players")
 
     # Snap counts — only offensive snaps matter
+    # Primary key: (pfr_player_id, game_id) — matches player_lookup pfr_id
     snap_lookup = {}
     for _, row in snap_df.iterrows():
         pfr_id = row.get("pfr_player_id", "")
@@ -201,7 +202,29 @@ def _build_player_lookups(
     if logger:
         logger.info(f"[PIC]   Snap lookup: {len(snap_lookup)} player-game records")
 
-    return player_lookup, snap_lookup
+    # Build reverse map: pfr_id → gsis_id for players missing pfr_id in snap data
+    # Snap counts use pfr_player_id; PBP offense_players uses gsis_id.
+    # 10% of players have no pfr_id — build a gsis→snap fallback using player name matching.
+    # Simpler approach: build a gsis_id keyed snap lookup as well using the players_df bridge.
+    pfr_to_gsis = {}
+    for gsis, info in player_lookup.items():
+        pfr = info.get("pfr_id", "")
+        if pfr:
+            pfr_to_gsis[pfr] = gsis
+
+    # Build gsis-keyed snap lookup for players whose pfr_id is missing
+    # This allows direct gsis_id lookup as fallback
+    snap_lookup_by_gsis = {}
+    for (pfr_id, game_id), snap_data in snap_lookup.items():
+        gsis = pfr_to_gsis.get(pfr_id)
+        if gsis:
+            snap_lookup_by_gsis[(gsis, game_id)] = snap_data
+
+    if logger:
+        logger.info(f"[PIC]   Snap lookup by gsis_id: {len(snap_lookup_by_gsis)} player-game records "
+                   f"({len(snap_lookup_by_gsis)/max(len(snap_lookup),1)*100:.0f}% of snap records bridged)")
+
+    return player_lookup, snap_lookup, snap_lookup_by_gsis
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +400,7 @@ def _aggregate_drive_personnel(
     pbp_off: pd.DataFrame,
     player_lookup: Dict,
     snap_lookup: Dict,
+    snap_lookup_by_gsis: Dict,
     logger=None,
 ) -> pd.DataFrame:
     """
@@ -680,6 +704,7 @@ def _build_game_pic_features(
     player_cycles: Dict,
     player_lookup: Dict,
     snap_lookup: Dict,
+    snap_lookup_by_gsis: Dict,
     career_epa: Dict,
     logger=None,
 ) -> pd.DataFrame:
@@ -773,7 +798,10 @@ def _build_game_pic_features(
             pfr_id = info["pfr_id"]
 
             # Snap percentage this game as usage weight
+            # Primary: pfr_id lookup. Fallback: gsis_id lookup for players missing pfr_id
             snap_info = snap_lookup.get((pfr_id, game_id), {})
+            if not snap_info and gsis:
+                snap_info = snap_lookup_by_gsis.get((gsis, game_id), {})
             snap_pct = snap_info.get("offense_pct", 0) or 0
 
             # Skip bench warmers — below threshold means essentially absent

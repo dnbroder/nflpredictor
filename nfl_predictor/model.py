@@ -117,10 +117,15 @@ def train_model(
     # Feature correlation with target
     logger.info("[MODEL] Feature-target correlations (top 15):")
     correlations = {}
+    import warnings
     for col in available_features:
         valid_mask = X[col].notna() & y.notna()
         if valid_mask.sum() > 100:
-            correlations[col] = X.loc[valid_mask, col].corr(y[valid_mask])
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                corr = X.loc[valid_mask, col].corr(y[valid_mask])
+            if not np.isnan(corr):
+                correlations[col] = corr
     sorted_corrs = sorted(correlations.items(), key=lambda x: abs(x[1]), reverse=True)
     for feat, corr in sorted_corrs[:15]:
         logger.info(f"[MODEL]   {feat}: {corr:+.4f}")
@@ -208,7 +213,7 @@ def train_model(
     logger.info(f"[MODEL]   Log Loss:    {logloss:.4f}")
     logger.info(f"[MODEL]   Brier Score: {brier:.4f}")
 
-    report = classification_report(y_test, y_pred)
+    report = classification_report(y_test, y_pred, zero_division=0)
     for line in report.split("\n"):
         if line.strip():
             logger.info(f"[MODEL]   {line}")
