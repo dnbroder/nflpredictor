@@ -704,14 +704,27 @@ def _build_game_pic_features(
     """
     records = []
 
-    # Build ordered game list per team for lag
-    game_order = (
+    # Build ordered game list per team for lag — MUST sort by season+week, not game_id string.
+    # game_id strings like "2020_01_ARI_SF" sort alphabetically within a week,
+    # not chronologically. Sorting by season then week ensures correct temporal ordering
+    # so prev_game_id always points to the team's actual previous game.
+    game_meta = (
         drive_personnel[["game_id", "posteam"]]
         .drop_duplicates()
-        .sort_values("game_id")
+        .copy()
     )
-    game_order["prev_game_id"] = game_order.groupby("posteam")["game_id"].shift(1)
-    prev_game_map = game_order.set_index(["posteam", "game_id"])["prev_game_id"].to_dict()
+    # Extract season and week from game_id (format: YYYY_WW_AWAY_HOME)
+    game_meta["season"] = game_meta["game_id"].str.split("_").str[0].astype(int)
+    game_meta["week"]   = game_meta["game_id"].str.split("_").str[1].astype(int)
+    game_meta = game_meta.sort_values(["season", "week", "game_id"])
+    game_meta["prev_game_id"] = game_meta.groupby("posteam")["game_id"].shift(1)
+    prev_game_map = game_meta.set_index(["posteam", "game_id"])["prev_game_id"].to_dict()
+
+    if logger:
+        n_with_prev = sum(1 for v in prev_game_map.values() if v is not None and str(v) != "nan")
+        n_total = len(prev_game_map)
+        logger.info(f"[PIC]   Game order: {n_total} team-game entries, "
+                   f"{n_with_prev} have a previous game for cycle lag")
 
     for (game_id, posteam), game_drives in drive_personnel.groupby(["game_id", "posteam"]):
         prev_game_id = prev_game_map.get((posteam, game_id))
