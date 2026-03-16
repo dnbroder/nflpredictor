@@ -69,6 +69,7 @@ PBP_COLS = [
     "vegas_home_wp",
     "posteam_score", "defteam_score",
     "score_differential",
+    "total_home_score", "total_away_score",  # Q1/H1 pace signal (PIM Layer 4)
     "half_seconds_remaining", "game_seconds_remaining",
     "drive",          # drive number
     "fixed_drive",    # corrected drive number
@@ -242,7 +243,8 @@ def load_plays(
     Used as raw input for drive aggregation and L3 PIC computation.
     """
     seasons = seasons or list(range(2016, CURRENT_SEASON + 1))
-    cache_key = f"data/pbp/plays_{min(seasons)}_{max(seasons)}.parquet"
+    # v2: added total_home_score, total_away_score for Q1 pace signal
+    cache_key = f"data/pbp/plays_{min(seasons)}_{max(seasons)}_v2.parquet"
     t0 = time.time()
 
     logger.info(f"[DATA] load_plays: seasons={seasons}, cache={cache}")
@@ -266,10 +268,17 @@ def load_plays(
             season_cache_key = f"data/pbp/plays_{season}.parquet"
             season_cached = _load_from_s3(season_cache_key) if cache else None
             if season_cached is not None:
-                mb = season_cached.memory_usage(deep=True).sum() / 1024 / 1024
-                logger.info(f"[DATA] Season {season} PBP cache HIT: {len(season_cached)} plays ({mb:.0f}MB)")
-                dfs.append(season_cached)
-                continue
+                # Validate cached parquet has required columns — bust cache if stale
+                missing_cols = [c for c in ["total_home_score", "total_away_score"]
+                                if c not in season_cached.columns]
+                if missing_cols:
+                    logger.warning(f"[DATA] Season {season} PBP cache STALE — missing {missing_cols}, re-downloading")
+                    season_cached = None
+                else:
+                    mb = season_cached.memory_usage(deep=True).sum() / 1024 / 1024
+                    logger.info(f"[DATA] Season {season} PBP cache HIT: {len(season_cached)} plays ({mb:.0f}MB)")
+                    dfs.append(season_cached)
+                    continue
 
             t1 = time.time()
             logger.info(f"[DATA] Downloading PBP season {season} ({i}/{len(seasons)})...")
