@@ -486,10 +486,20 @@ def load_closing_lines(
         cached = _load_from_s3(cache_key)
         if cached is not None:
             logger.info(f"[DATA] Closing lines S3 cache HIT: {len(cached)} games in {time.time()-t0:.1f}s")
-            # Log per-season coverage from cache so we know if it's complete
             if "season" in cached.columns:
                 for s, grp in cached.groupby("season"):
                     logger.info(f"[DATA]   {s}: {len(grp)} games cached")
+            # Supplement with SBR data for seasons not covered by Odds API (≤2019)
+            sbr_seasons_needed = [s for s in seasons if s <= 2019]
+            if sbr_seasons_needed:
+                cached_game_ids = set(cached["game_id"].tolist())
+                sbr_df = load_sbr_closing_lines(sbr_seasons_needed)
+                if len(sbr_df) > 0:
+                    # Only add games not already in the cached Odds API data
+                    sbr_new = sbr_df[~sbr_df["game_id"].isin(cached_game_ids)]
+                    if len(sbr_new) > 0:
+                        cached = pd.concat([cached, sbr_new], ignore_index=True)
+                        logger.info(f"[DATA] SBR supplement: added {len(sbr_new)} games for seasons {sbr_seasons_needed}")
             return cached
 
     if not api_key:
@@ -767,6 +777,77 @@ def load_closing_lines(
         logger.error(f"[DATA] load_closing_lines failed: {e}", exc_info=True)
         return pd.DataFrame()
 
+
+
+
+def load_sbr_closing_lines(seasons, s3_client=None, bucket=None):
+    """
+    Load SBR historical closing totals for seasons 2016-2019 from S3.
+    Returns DataFrame with same schema as load_closing_lines():
+        game_id, season, week, home_team, away_team, closing_total, closing_spread
+    Only returns rows for games NOT already covered by the Odds API.
+    """
+    import io as _io
+    s3_key = "data/odds/sbr_closing_lines_2016_2019.parquet"
+    sbr_seasons = [s for s in seasons if s <= 2019]
+    if not sbr_seasons:
+        return pd.DataFrame()
+
+    try:
+        if s3_client is None:
+            import boto3
+            s3_client = boto3.client("s3", region_name="us-east-1")
+        if bucket is None:
+            bucket = os.environ.get("S3_BUCKET", "nfl-predictor-bucket")
+
+        obj = s3_client.get_object(Bucket=bucket, Key=s3_key)
+        df = pd.read_parquet(_io.BytesIO(obj["Body"].read()))
+        df = df[df["season"].isin(sbr_seasons)].copy()
+
+        if len(df) == 0:
+            return pd.DataFrame()
+
+        # Match SBR records to nfl_data_py game_ids via schedule
+        import nfl_data_py as nfl
+        schedule = nfl.import_schedules(sbr_seasons)
+        schedule = schedule[schedule["home_score"].notna()].copy()
+
+        # Build lookup: (season, away_team, home_team) → game_id + week
+        sched_lookup = {}
+        for _, row in schedule.iterrows():
+            key = (int(row["season"]), str(row["away_team"]), str(row["home_team"]))
+            sched_lookup[key] = (row["game_id"], row.get("week"))
+            # Also try flipped for neutral sites
+            key_flip = (int(row["season"]), str(row["home_team"]), str(row["away_team"]))
+            if key_flip not in sched_lookup:
+                sched_lookup[key_flip] = (row["game_id"], row.get("week"))
+
+        rows = []
+        for _, sbr_row in df.iterrows():
+            key = (int(sbr_row["season"]), str(sbr_row["away_team"]), str(sbr_row["home_team"]))
+            match = sched_lookup.get(key)
+            if match:
+                game_id, week = match
+                rows.append({
+                    "game_id":        game_id,
+                    "season":         int(sbr_row["season"]),
+                    "week":           week,
+                    "home_team":      sbr_row["home_team"],
+                    "away_team":      sbr_row["away_team"],
+                    "closing_total":  float(sbr_row["closing_total"]),
+                    "closing_spread": None,
+                })
+
+        result = pd.DataFrame(rows)
+        logger.info(
+            f"[DATA] SBR closing lines: {len(result)}/{len(df)} games matched "
+            f"for seasons {sbr_seasons}"
+        )
+        return result
+
+    except Exception as e:
+        logger.warning(f"[DATA] SBR closing lines load failed: {e}")
+        return pd.DataFrame()
 
 def load_epa_by_game(
     seasons: List[int] = None,
