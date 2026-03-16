@@ -185,17 +185,27 @@ def train_model(
     use_calibration = best_iteration is not None and best_iteration > 10
     if use_calibration:
         raw_cal = xgb_model.predict_proba(X_cal)[:, 1]
+        raw_std = raw_cal.std()
         logger.info(f"[MODEL] Calibrating (isotonic regression, best_iteration={best_iteration} > 10)...")
-        logger.info(f"[MODEL]   Raw cal proba — mean={raw_cal.mean():.3f}, "
-                   f"min={raw_cal.min():.3f}, max={raw_cal.max():.3f}")
-        calibrator = IsotonicRegression(out_of_bounds="clip")
-        calibrator.fit(raw_cal, y_cal)
-        # Diagnostic: check cal set output range post-calibration
-        cal_out = calibrator.predict(raw_cal)
-        logger.info(f"[MODEL]   Post-calibration — mean={cal_out.mean():.3f}, "
-                   f"min={cal_out.min():.3f}, max={cal_out.max():.3f}, "
-                   f"above_0.5={( cal_out >= 0.5).sum()}/{len(cal_out)}")
-        logger.info("[MODEL] Calibration applied")
+        logger.info(f"[MODEL]   Raw cal proba — mean={raw_cal.mean():.3f}, min={raw_cal.min():.3f}, max={raw_cal.max():.3f}, std={raw_std:.3f}")
+
+        # Guard: isotonic degrades to a step function when raw spread is too narrow.
+        # With std < 0.08, the calibrator maps all mid-range scores to one plateau
+        # and makes confidence tiers meaningless. Raw probabilities are more useful.
+        MIN_RAW_STD = 0.08
+        if raw_std < MIN_RAW_STD:
+            logger.warning(f"[MODEL] Skipping calibration — raw std={raw_std:.3f} < {MIN_RAW_STD} "
+                          f"(distribution too narrow; isotonic would produce step function). "
+                          f"Using raw XGBoost probabilities.")
+            use_calibration = False
+        else:
+            calibrator = IsotonicRegression(out_of_bounds="clip")
+            calibrator.fit(raw_cal, y_cal)
+            cal_out = calibrator.predict(raw_cal)
+            logger.info(f"[MODEL]   Post-calibration — mean={cal_out.mean():.3f}, "
+                       f"min={cal_out.min():.3f}, max={cal_out.max():.3f}, "
+                       f"above_0.5={(cal_out >= 0.5).sum()}/{len(cal_out)}")
+            logger.info("[MODEL] Calibration applied")
     else:
         logger.warning(f"[MODEL] Skipping calibration — best_iteration={best_iteration} <= 10 "
                        "(too few trees; raw probabilities more reliable than calibrated flat scores)")
