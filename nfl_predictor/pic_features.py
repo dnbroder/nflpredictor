@@ -126,6 +126,14 @@ def build_pic_features(
         logger.info("[PIC] Step 2: Filtering PBP to offensive possession plays...")
     pbp_off = _filter_offensive_plays(pbp_df, logger)
 
+    # Step 2b: Compute PBP-derived snap percentages — no external join needed.
+    # import_snap_counts() pfr_player_id only overlaps ~45% with import_players() pfr_id,
+    # making the external snap lookup unreliable. Instead, count play appearances per
+    # player per game directly from offense_players column.
+    if logger:
+        logger.info("[PIC] Step 2b: Computing PBP-derived snap percentages...")
+    pbp_snap_pct = _compute_pbp_snap_pct(pbp_off, logger)
+
     # Step 3: Aggregate drive personnel — base group + key player presence
     if logger:
         logger.info("[PIC] Step 3: Aggregating drive-level personnel...")
@@ -140,7 +148,7 @@ def build_pic_features(
     if logger:
         logger.info("[PIC] Step 5: Building game-level PIC features...")
     game_pic = _build_game_pic_features(
-        drive_personnel, player_cycles, player_lookup, snap_lookup, snap_lookup_by_gsis, career_epa, logger
+        drive_personnel, player_cycles, player_lookup, snap_lookup, snap_lookup_by_gsis, pbp_snap_pct, career_epa, logger
     )
 
     # Step 6: Merge onto game-team rows
@@ -185,7 +193,11 @@ def _build_player_lookups(
             }
 
     if logger:
-        logger.info(f"[PIC]   Player lookup: {len(player_lookup)} offensive players")
+        n_with_pfr = sum(1 for v in player_lookup.values() if v.get("pfr_id"))
+        n_no_pfr = len(player_lookup) - n_with_pfr
+        logger.info(f"[PIC]   Player lookup: {len(player_lookup)} offensive players "
+                   f"({n_with_pfr} with pfr_id, {n_no_pfr} missing pfr_id — "
+                   f"external snap lookup will miss {n_no_pfr/len(player_lookup)*100:.0f}% of players)")
 
     # Snap counts — only offensive snaps matter
     # Primary key: (pfr_player_id, game_id) — matches player_lookup pfr_id
@@ -350,6 +362,77 @@ def _compute_career_epa(pbp_df: pd.DataFrame, logger=None) -> Dict:
             logger.info(f"[PIC]   Players without EPA score get median weight (0.5)")
 
     return career_epa
+
+# ---------------------------------------------------------------------------
+# Step 2b: PBP-derived snap percentages
+# ---------------------------------------------------------------------------
+
+def _compute_pbp_snap_pct(pbp_off: pd.DataFrame, logger=None) -> Dict:
+    """
+    Compute snap percentage per player per game directly from PBP offense_players column.
+
+    Replaces the unreliable import_snap_counts() bridge which only has ~45% pfr_id
+    overlap with import_players(). This approach uses only gsis_ids from PBP —
+    no external join required.
+
+    Returns dict: (gsis_id, game_id) → snap_pct (0.0–1.0)
+    where 1.0 = player appeared on every offensive play this game.
+
+    NOTE: Called AFTER _filter_offensive_plays so snap_pct reflects only
+    offensive possession plays, consistent with how the cycle is computed.
+    """
+    if pbp_off is None or len(pbp_off) == 0 or "offense_players" not in pbp_off.columns:
+        if logger:
+            logger.warning("[PIC]   PBP snap pct: no offense_players column — skipping")
+        return {}
+
+    # Count total offensive plays per game
+    plays_per_game = pbp_off.groupby("game_id").size().to_dict()
+
+    # Count appearances per player per game
+    player_game_counts = {}
+
+    for _, row in pbp_off.iterrows():
+        game_id = row.get("game_id", "")
+        raw = row.get("offense_players", "")
+        if not game_id or not raw:
+            continue
+        for gsis in raw.split(";"):
+            gsis = gsis.strip()
+            if gsis:
+                key = (gsis, game_id)
+                player_game_counts[key] = player_game_counts.get(key, 0) + 1
+
+    # Convert counts to percentages
+    pbp_snap_pct = {}
+    for (gsis, game_id), count in player_game_counts.items():
+        total = plays_per_game.get(game_id, 0)
+        if total > 0:
+            pbp_snap_pct[(gsis, game_id)] = count / total
+
+    if logger:
+        logger.info(f"[PIC]   PBP snap pct: {len(pbp_snap_pct)} player-game records computed "
+                   f"across {len(plays_per_game)} games")
+        if pbp_snap_pct:
+            vals = list(pbp_snap_pct.values())
+            above_threshold = sum(1 for v in vals if v >= MIN_SNAP_PCT_THRESHOLD)
+            logger.info(f"[PIC]   PBP snap pct ≥{MIN_SNAP_PCT_THRESHOLD}: "
+                       f"{above_threshold}/{len(vals)} ({above_threshold/len(vals)*100:.0f}%) "
+                       f"pass usage threshold")
+            logger.info(f"[PIC]   PBP snap pct distribution: "
+                       f"mean={sum(vals)/len(vals):.2f}, "
+                       f"min={min(vals):.2f}, max={max(vals):.2f}")
+            # Log a few sample entries so you can verify gsis_id format matches player_lookup
+            sample_keys = list(pbp_snap_pct.keys())[:3]
+            for k in sample_keys:
+                logger.info(f"[PIC]   PBP snap sample: gsis={k[0]} game={k[1]} pct={pbp_snap_pct[k]:.2f}")
+            # Log plays_per_game range to catch anomalous games
+            play_counts = list(plays_per_game.values())
+            logger.info(f"[PIC]   Plays per game: mean={sum(play_counts)/len(play_counts):.0f}, "
+                       f"min={min(play_counts)}, max={max(play_counts)}")
+
+    return pbp_snap_pct
+
 
 def _filter_offensive_plays(pbp_df: pd.DataFrame, logger=None) -> pd.DataFrame:
     """
@@ -705,6 +788,7 @@ def _build_game_pic_features(
     player_lookup: Dict,
     snap_lookup: Dict,
     snap_lookup_by_gsis: Dict,
+    pbp_snap_pct: Dict,
     career_epa: Dict,
     logger=None,
 ) -> pd.DataFrame:
@@ -728,6 +812,11 @@ def _build_game_pic_features(
         pic_present_quality:     weighted quality of players who ARE present
     """
     records = []
+    # Diagnostic counters — track snap_pct source across all players processed
+    _snap_from_pbp = 0
+    _snap_from_external = 0
+    _snap_below_threshold = 0
+    _snap_missing = 0
 
     # Build ordered game list per team for lag — MUST sort by season+week, not game_id string.
     # game_id strings like "2020_01_ARI_SF" sort alphabetically within a week,
@@ -797,15 +886,27 @@ def _build_game_pic_features(
             weight = info["weight"]
             pfr_id = info["pfr_id"]
 
-            # Snap percentage this game as usage weight
-            # Primary: pfr_id lookup. Fallback: gsis_id lookup for players missing pfr_id
-            snap_info = snap_lookup.get((pfr_id, game_id), {})
-            if not snap_info and gsis:
-                snap_info = snap_lookup_by_gsis.get((gsis, game_id), {})
-            snap_pct = snap_info.get("offense_pct", 0) or 0
+            # Snap percentage this game as usage weight.
+            # PRIMARY: PBP-derived snap pct — computed from offense_players column,
+            # no external join needed. 100% gsis_id coverage.
+            # FALLBACK: external snap_lookup (pfr_id) and snap_lookup_by_gsis for
+            # any edge cases where PBP data is missing offense_players.
+            snap_pct = pbp_snap_pct.get((gsis, game_id), None)
+            if snap_pct is not None:
+                _snap_from_pbp += 1
+            else:
+                snap_info = snap_lookup.get((pfr_id, game_id), {})
+                if not snap_info:
+                    snap_info = snap_lookup_by_gsis.get((gsis, game_id), {})
+                snap_pct = snap_info.get("offense_pct", 0) or 0
+                if snap_pct > 0:
+                    _snap_from_external += 1
+                else:
+                    _snap_missing += 1
 
             # Skip bench warmers — below threshold means essentially absent
             if snap_pct < MIN_SNAP_PCT_THRESHOLD:
+                _snap_below_threshold += 1
                 continue
 
             # Get player's cycle state from previous game
@@ -865,6 +966,12 @@ def _build_game_pic_features(
     df = pd.DataFrame(records)
 
     if logger:
+        total_lookups = _snap_from_pbp + _snap_from_external + _snap_missing + _snap_below_threshold
+        logger.info(f"[PIC]   Snap pct source breakdown ({total_lookups} player-game lookups):")
+        logger.info(f"[PIC]     PBP-derived (primary):  {_snap_from_pbp} ({_snap_from_pbp/max(total_lookups,1)*100:.0f}%)")
+        logger.info(f"[PIC]     External fallback:       {_snap_from_external} ({_snap_from_external/max(total_lookups,1)*100:.0f}%)")
+        logger.info(f"[PIC]     Below threshold (≥{MIN_SNAP_PCT_THRESHOLD}): {_snap_below_threshold} ({_snap_below_threshold/max(total_lookups,1)*100:.0f}%) — filtered out")
+        logger.info(f"[PIC]     Missing entirely:        {_snap_missing} ({_snap_missing/max(total_lookups,1)*100:.0f}%) — treated as absent")
         logger.info(f"[PIC]   Game PIC features: {len(df)} team-game rows")
         for col in ["pic_qb_in_zone", "pic_ol_sync_rate", "pic_team_alignment",
                     "pic_skill_sync_rate", "pic_present_quality", "pic_avg_player_epa"]:
