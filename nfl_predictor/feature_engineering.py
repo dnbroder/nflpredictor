@@ -26,6 +26,27 @@ warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
 # ---------------------------------------------------------------------------
 # Target
 # ---------------------------------------------------------------------------
+# ── Live betting features (computed from in-game PBP, NOT used in pre-game model) ──
+# These features are valid ONLY after Q1/H1 has been played.
+# They encode the Q1/H1 pace signal for live in-game betting.
+# Data leakage risk: using these in pre-game training inflates AUC to ~0.80
+# because Q1 scoring is partially determined by the same factors as final score.
+# Architecture: pre-game model fires first, live model refines after Q1 ends.
+LIVE_FEATURE_COLUMNS = [
+    "pim_q1_pct_of_total",          # q1_combined / closing_total — primary live signal
+    "pim_q1_epa_per_drive",         # avg EPA per Q1 drive (efficiency without scoring)
+    "pim_q1_scoring_drives",        # number of scoring drives in Q1
+    "pim_q1_cycle_confirmed",       # 1 if pre-game dual_optimal AND q1_pct >= 0.20
+    "pim_q1_cycle_contradicted",    # 1 if pre-game dual_optimal AND q1_pct <= 0.10
+    "pim_h1_pct_of_total",          # h1_combined / closing_total — halftime live signal
+]
+
+# Validated live signal thresholds (887 games, 2016-2019):
+#   pim_q1_pct_of_total <= 0.10  → 25% over rate (strong under lean)
+#   pim_q1_pct_of_total >= 0.25  → 69-82% over rate (strong over lean)
+#   pim_h1_pct_of_total < 0.30   → 11% over rate (near-certain under)
+#   pim_h1_pct_of_total >= 0.80  → 100% over rate (56/56 games)
+
 TARGET_COLUMN = "over_total"  # game goes over the total line
 TARGET_COLUMNS = {"over_total": "over_total"}  # dict for model.py compatibility
 
@@ -99,19 +120,7 @@ FEATURE_COLUMNS = [
     "pic_ol_composite",
     "pic_pass_rush_opp",
 
-    # ── Layer 4: PIM — Q1 Pace Signal (historical confirmation) ─────────
-    # Q1 pace = combined Q1 score / closing_total.
-    # Threshold: >=25% → over rate 69-82%. <=10% → over rate 25%.
-    # These are historical features computed from PBP at training time.
-    # They encode the market calibration signal: high Q1 pace = market
-    # underpriced the game. Low Q1 pace = market overpriced it.
-    "pim_q1_pct_of_total",          # q1_combined / closing_total (team's game)
-    "pim_q1_epa_per_drive",         # avg EPA per Q1 drive (efficiency signal)
-    "pim_q1_scoring_drives",        # number of scoring drives in Q1
-    "pim_q1_cycle_confirmed",       # 1 if dual_optimal AND q1_pct >= 0.20
-    "pim_q1_cycle_contradicted",    # 1 if dual_optimal AND q1_pct <= 0.10
-    "pim_h1_pct_of_total",          # h1_combined / closing_total (halftime pace)
-    # Legacy PIM stubs (Phase 4 — not yet implemented)
+    # ── Layer 4: PIM stubs (Phase 4 — not yet implemented) ──────────────
     "pim_trajectory",               # PIM-adjusted trajectory composite
     "pim_salary_signal",            # salary arbitrage revealed-preference signal
     "pim_volatility",               # roster reliability (lower = better)
