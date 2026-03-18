@@ -499,7 +499,7 @@ def load_closing_lines(
                 for s, grp in cached.groupby("season"):
                     logger.info(f"[DATA]   {s}: {len(grp)} games cached")
             # Supplement with SBR data for seasons not covered by Odds API (≤2019)
-            sbr_seasons_needed = [s for s in seasons if s <= 2019]
+            sbr_seasons_needed = [s for s in seasons if s <= 2019]  # SBR covers 2013-2019
             if sbr_seasons_needed:
                 cached_game_ids = set(cached["game_id"].tolist())
                 sbr_df = load_sbr_closing_lines(sbr_seasons_needed)
@@ -797,8 +797,9 @@ def load_sbr_closing_lines(seasons, s3_client=None, bucket=None):
     Only returns rows for games NOT already covered by the Odds API.
     """
     import io as _io
-    s3_key = "data/odds/sbr_closing_lines_2016_2019.parquet"
+    # Try expanded file first (2013-2019), fall back to original (2016-2019)
     sbr_seasons = [s for s in seasons if s <= 2019]
+    s3_key = "data/odds/sbr_closing_lines_2013_2019.parquet"
     if not sbr_seasons:
         return pd.DataFrame()
 
@@ -822,36 +823,59 @@ def load_sbr_closing_lines(seasons, s3_client=None, bucket=None):
         schedule = schedule[schedule["home_score"].notna()].copy()
 
         # Build lookup: (season, away_team, home_team) → game_id + week
+        # Also index by week to handle neutral site games (Super Bowl, London)
         sched_lookup = {}
         for _, row in schedule.iterrows():
             key = (int(row["season"]), str(row["away_team"]), str(row["home_team"]))
             sched_lookup[key] = (row["game_id"], row.get("week"))
-            # Also try flipped for neutral sites
+            # Flipped — neutral site / SBR home/away inconsistency
             key_flip = (int(row["season"]), str(row["home_team"]), str(row["away_team"]))
             if key_flip not in sched_lookup:
                 sched_lookup[key_flip] = (row["game_id"], row.get("week"))
 
+        # SBR team abbreviation fixes for edge cases not in main map
+        SBR_FIXUPS = {
+            "JAC": "JAX",   # SBR sometimes uses JAC
+            "HST": "HOU",   # SBR Houston
+            "CLV": "CLE",   # SBR Cleveland
+            "ARZ": "ARI",   # SBR Arizona
+            "SL":  "LAR",   # old St. Louis abbreviation
+            "SD":  "LAC",   # old San Diego abbreviation
+            "OAK": "LV",    # Oakland Raiders
+        }
+
         rows = []
+        missed = []
         for _, sbr_row in df.iterrows():
-            key = (int(sbr_row["season"]), str(sbr_row["away_team"]), str(sbr_row["home_team"]))
+            away = SBR_FIXUPS.get(str(sbr_row["away_team"]), str(sbr_row["away_team"]))
+            home = SBR_FIXUPS.get(str(sbr_row["home_team"]), str(sbr_row["home_team"]))
+            key = (int(sbr_row["season"]), away, home)
             match = sched_lookup.get(key)
+            # Try original if fixup didn't help
+            if not match:
+                key_orig = (int(sbr_row["season"]), str(sbr_row["away_team"]), str(sbr_row["home_team"]))
+                match = sched_lookup.get(key_orig)
             if match:
                 game_id, week = match
                 rows.append({
                     "game_id":        game_id,
                     "season":         int(sbr_row["season"]),
                     "week":           week,
-                    "home_team":      sbr_row["home_team"],
-                    "away_team":      sbr_row["away_team"],
+                    "home_team":      home,
+                    "away_team":      away,
                     "closing_total":  float(sbr_row["closing_total"]),
                     "closing_spread": None,
                 })
+            else:
+                missed.append((int(sbr_row["season"]), away, home))
 
         result = pd.DataFrame(rows)
         logger.info(
             f"[DATA] SBR closing lines: {len(result)}/{len(df)} games matched "
             f"for seasons {sbr_seasons}"
         )
+        if missed:
+            logger.debug(f"[DATA] SBR unmatched games ({len(missed)}): {missed[:10]}")
         return result
 
     except Exception as e:

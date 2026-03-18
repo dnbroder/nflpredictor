@@ -517,12 +517,19 @@ def _compute_bsr_features(values: np.ndarray, min_history: int = 15) -> dict:
 
             peaks = [
                 j for j in range(2, min(len(ac) - 1, 20))
-                if ac[j] > ac[j-1] and ac[j] > ac[j+1] and ac[j] > 0.15
+                if ac[j] > ac[j-1] and ac[j] > ac[j+1] and ac[j] > 0.08
             ]
             if peaks:
                 cycle_len = peaks[0]
                 rounds_since = len(valid) % cycle_len
                 cycle_position[i] = rounds_since / cycle_len
+            else:
+                # Fallback: use mean scoring interval as cycle estimate
+                # If team scores ~38% of drives, average cycle ≈ 2.6 drives
+                mean_rate = np.mean(valid) if np.mean(valid) > 0 else 0.38
+                est_cycle = max(2, round(1.0 / mean_rate)) if mean_rate > 0 else 3
+                rounds_since = len(valid) % est_cycle
+                cycle_position[i] = rounds_since / est_cycle
 
         # Hot/cold streak probability
         recent = valid[-5:] if len(valid) >= 5 else valid
@@ -1229,7 +1236,7 @@ def _build_q1_pace_features(
                 df["_q1_bucket"] = pd.cut(
                     df["pim_q1_pct_of_total"], bins=buckets, labels=labels
                 )
-                bucket_stats = df.groupby("_q1_bucket")["over_total"].agg(["mean", "count"])
+                bucket_stats = df.groupby("_q1_bucket", observed=False)["over_total"].agg(["mean", "count"])
                 logger.info("[PIM]   Q1 pace → over rate (training set):")
                 for label, row in bucket_stats.iterrows():
                     if row["count"] >= 10:
