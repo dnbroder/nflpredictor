@@ -40,10 +40,23 @@ SBR_TO_NFL = {
     'Arizona': 'ARI', 'LosAngeles': 'LAR', 'SanFrancisco': 'SF', 'Seattle': 'SEA',
     # Post-move names
     'LARams': 'LAR', 'LAChargers': 'LAC',
-    # Alternate spellings SBR uses
+    # Alternate spellings SBR uses (2016-2019 format)
     'NewYorkJets': 'NYJ', 'NewYorkGiants': 'NYG', 'KansasCity': 'KC',
     'GreenBay': 'GB', 'NewEngland': 'NE', 'NewOrleans': 'NO', 'TampaBay': 'TB',
     'SanFrancisco': 'SF', 'SanDiego': 'LAC', 'LasVegas': 'LV',
+    # 2013-2015 SBR used single-word or abbreviated names
+    'Arizona': 'ARI', 'Atlanta': 'ATL', 'Baltimore': 'BAL',
+    'Buffalo': 'BUF', 'BuffaloBills': 'BUF',
+    'Carolina': 'CAR', 'Chicago': 'CHI', 'Cincinnati': 'CIN',
+    'Cleveland': 'CLE', 'Dallas': 'DAL', 'Denver': 'DEN',
+    'Detroit': 'DET', 'Houston': 'HOU', 'Indianapolis': 'IND',
+    'Jacksonville': 'JAX', 'Miami': 'MIA', 'Minnesota': 'MIN',
+    'NewOrleans': 'NO', 'NewYork': 'NYJ',  # NYJ listed as NewYork in some years
+    'NYGiants': 'NYG', 'Oakland': 'LV', 'Philadelphia': 'PHI',
+    'Pittsburgh': 'PIT', 'SanDiego': 'LAC', 'SanFrancisco': 'SF',
+    'Seattle': 'SEA', 'St.Louis': 'LAR', 'StLouis': 'LAR',
+    'TampaBay': 'TB', 'Tennessee': 'TEN', 'Washington': 'WAS',
+    'GreenBay': 'GB', 'KansasCity': 'KC',
 }
 
 
