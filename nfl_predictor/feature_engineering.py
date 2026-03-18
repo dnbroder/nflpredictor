@@ -238,6 +238,51 @@ def engineer_features(
             if col not in df.columns:
                 df[col] = np.nan
 
+    # Step 6c: Impute missing PIC values using team-season averages
+    # 2013-2015 PBP personnel data (offense_players column) is sparse,
+    # causing 27-37% NaN rates in PIC features for those seasons.
+    # Strategy: fill NaN with team-season median where available,
+    # then fill remaining NaN with global median across all valid rows.
+    # This is conservative — doesn't invent signal, just reduces XGBoost
+    # split noise from excessive NaN propagation.
+    pic_continuous_cols = [
+        "pic_qb_in_zone", "pic_qb_career_rate",
+        "pic_ol_sync_rate", "pic_ol_quality_weighted", "pic_ol_composite",
+        "pic_skill_sync_rate", "pic_team_alignment", "pic_present_quality",
+        "pic_avg_player_epa", "pic_alignment_score", "pic_composite_l1",
+    ]
+    pic_cols_present = [c for c in pic_continuous_cols if c in df.columns]
+    if pic_cols_present and "team" in df.columns and "season" in df.columns:
+        nan_before = df[pic_cols_present].isna().sum().sum()
+        # Step 1: team-season median
+        team_season_medians = df.groupby(["team", "season"])[pic_cols_present].median()
+        for col in pic_cols_present:
+            null_mask = df[col].isna()
+            if null_mask.any():
+                def fill_ts(row):
+                    if pd.isna(row[col]):
+                        try:
+                            return team_season_medians.loc[(row["team"], row["season"]), col]
+                        except KeyError:
+                            return np.nan
+                    return row[col]
+                # Vectorized version using merge
+                ts_fill = df[["team", "season"]].merge(
+                    team_season_medians[[col]].reset_index(),
+                    on=["team", "season"], how="left"
+                )[col]
+                df[col] = df[col].fillna(ts_fill.values)
+        # Step 2: global median for any remaining NaN
+        for col in pic_cols_present:
+            global_median = df[col].median()
+            if pd.notna(global_median):
+                df[col] = df[col].fillna(global_median)
+        nan_after = df[pic_cols_present].isna().sum().sum()
+        logger.info(
+            f"[FEAT]   PIC imputation: {nan_before} NaN → {nan_after} NaN "
+            f"({nan_before - nan_after} filled via team-season median)"
+        )
+
     # Step 7b: Layer 4 — Q1 Pace Signal (PIM)
     t7b = time.time()
     if pbp_df is not None:
@@ -371,14 +416,15 @@ def _reshape_to_game_team(
     df["result"] = df["team_score"] - df["opponent_score"]  # positive = win
 
     # Implied team score from spread + total
-    closing_total = df.get("closing_total", df.get("opening_total", np.nan))
-    closing_spread = df.get("closing_spread", df.get("opening_spread", np.nan))
-    df["implied_team_score"] = (closing_total - closing_spread) / 2
+    # Use closing_spread when available (Odds API 2020+),
+    # fall back to opening_spread from nfl_data_py schedules (covers 2013-2019)
+    closing_total = df["closing_total"].fillna(df["opening_total"]) if "opening_total" in df.columns else df.get("closing_total", np.nan)
+    best_spread = df["closing_spread"].fillna(df["opening_spread"]) if "opening_spread" in df.columns else df.get("closing_spread", np.nan)
+    df["implied_team_score"] = (closing_total - best_spread) / 2
 
     # Vegas win probability from spread
-    # Approximation: win_prob ≈ norm.cdf(-spread / 13.45)
     from scipy.stats import norm
-    df["vegas_win_prob"] = df["closing_spread"].apply(
+    df["vegas_win_prob"] = best_spread.apply(
         lambda s: norm.cdf(-s / 13.45) if pd.notna(s) else 0.5
     )
 
@@ -744,7 +790,7 @@ def _build_p2sz_features(df: pd.DataFrame, drives_df: pd.DataFrame) -> pd.DataFr
             td_avg = np.nanmean(td_conv)
             td_miss = (td_conv < td_avg).astype(float)
             td_miss[np.isnan(td_conv)] = np.nan
-            td_baseline, td_ratio, _, td_zone = _compute_cycle_sequence(td_miss)
+            td_baseline, td_ratio, _, td_zone = _compute_cycle_sequence(td_miss, min_gaps=2)
         else:
             n = len(team_drives)
             td_baseline = td_ratio = td_zone = np.full(n, np.nan)

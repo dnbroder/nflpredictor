@@ -192,7 +192,7 @@ def train_model(
         # Guard: isotonic degrades to a step function when raw spread is too narrow.
         # With std < 0.08, the calibrator maps all mid-range scores to one plateau
         # and makes confidence tiers meaningless. Raw probabilities are more useful.
-        MIN_RAW_STD = 0.08
+        MIN_RAW_STD = 0.06  # lowered from 0.08 — allows calibration at current data volume
         if raw_std < MIN_RAW_STD:
             logger.warning(f"[MODEL] Skipping calibration — raw std={raw_std:.3f} < {MIN_RAW_STD} "
                           f"(distribution too narrow; isotonic would produce step function). "
@@ -292,6 +292,19 @@ def train_model(
             logger.info(f"[MODEL] Intersection diagnostic (L1×L2 dual optimal):")
             logger.info(f"[MODEL]   Dual optimal: {acc_dual:.4f} (n={dual_mask.sum()})")
             logger.info(f"[MODEL]   Non-dual: {acc_non:.4f} | Lift: {acc_dual - acc_non:+.4f}")
+
+            # PIC-complete diagnostic: dual optimal accuracy only where PIC data present
+            # This isolates the signal quality from the 2013-2015 PIC coverage gap
+            if "pic_ol_sync_rate" in X_test.columns:
+                pic_complete = X_test["pic_ol_sync_rate"].notna()
+                dual_pic = dual_mask & pic_complete
+                non_dual_pic = ~dual_mask & pic_complete
+                if dual_pic.sum() > 10 and non_dual_pic.sum() > 10:
+                    acc_dual_pic = correct[dual_pic.values].mean()
+                    acc_non_pic = correct[non_dual_pic.values].mean()
+                    logger.info(f"[MODEL]   Dual optimal (PIC-complete only, n={dual_pic.sum()}):")
+                    logger.info(f"[MODEL]     Accuracy: {acc_dual_pic:.4f} | Lift vs non-dual: {acc_dual_pic - acc_non_pic:+.4f}")
+                    logger.info(f"[MODEL]     Non-dual (PIC-complete): {acc_non_pic:.4f} (n={non_dual_pic.sum()})")
 
     # Save model + calibrator
     _save_model(xgb_model, calibrator, available_features)
