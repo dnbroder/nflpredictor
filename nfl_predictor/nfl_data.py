@@ -484,7 +484,11 @@ def load_closing_lines(
         closing_total, closing_spread
     """
     seasons = seasons or list(range(2020, CURRENT_SEASON + 1))
-    cache_key = f"data/odds/closing_lines_{min(seasons)}_{max(seasons)}.parquet"
+    # Cache key always based on Odds API range (2020+), not full season range.
+    # Pre-2020 seasons are covered by SBR parquet supplement after cache load.
+    # v2 suffix: added total_home_score, total_away_score for Q1 pace signal.
+    _api_key_seasons = [s for s in seasons if s >= 2020] or [2020]
+    cache_key = f"data/odds/closing_lines_{min(_api_key_seasons)}_{max(_api_key_seasons)}_v2.parquet"
     t0 = time.time()
 
     api_key = os.environ.get("ODDS_API_KEY", "")
@@ -540,7 +544,18 @@ def load_closing_lines(
         #   23:59Z = midnight UTC (primetime/MNF)
         FETCH_HOURS = ["18:00:00Z", "21:00:00Z", "23:59:00Z"]
 
-        for season in seasons:
+        # Odds API historical data only available from 2020 onwards.
+        # Earlier seasons are covered by SBR parquet — skip API fetch for them.
+        ODDS_API_MIN_SEASON = 2020
+        api_seasons = [s for s in seasons if s >= ODDS_API_MIN_SEASON]
+        if len(api_seasons) < len(seasons):
+            skipped = [s for s in seasons if s < ODDS_API_MIN_SEASON]
+            logger.info(
+                f"[DATA] Odds API: skipping seasons {skipped} "
+                f"(pre-{ODDS_API_MIN_SEASON}, covered by SBR parquet)"
+            )
+
+        for season in api_seasons:
             season_games = schedule[schedule["season"] == season].copy()
             season_games["gameday"] = pd.to_datetime(season_games["gameday"], errors="coerce")
             dates = season_games["gameday"].dropna().unique()
