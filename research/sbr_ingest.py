@@ -121,6 +121,44 @@ def parse_sbr_season(text, season_year):
                 if closing_total is not None:
                     break
 
+            # Extract 2H (second half) total line from column 12
+            # 2H line is typically 18-45 range (half of full game total)
+            h2_line = None
+            for row in [v, h]:
+                try:
+                    if len(row) > 12:
+                        raw = row[12].replace('pk', '').strip()
+                        if raw:
+                            val = float(raw)
+                            if 10 < val < 50:
+                                h2_line = val
+                                break
+                except (ValueError, IndexError):
+                    pass
+
+            # Compute second half scores
+            # Q3+Q4 from each team
+            try:
+                away_q3 = float(v[6]) if len(v) > 6 else 0
+                away_q4 = float(v[7]) if len(v) > 7 else 0
+                home_q3 = float(h[6]) if len(h) > 6 else 0
+                home_q4 = float(h[7]) if len(h) > 7 else 0
+                h2_combined = away_q3 + away_q4 + home_q3 + home_q4
+            except (ValueError, IndexError):
+                h2_combined = None
+
+            # Q1+Q2 scores
+            try:
+                away_q1 = float(v[4]) if len(v) > 4 else 0
+                away_q2 = float(v[5]) if len(v) > 5 else 0
+                home_q1 = float(h[4]) if len(h) > 4 else 0
+                home_q2 = float(h[5]) if len(h) > 5 else 0
+                h1_combined = away_q1 + away_q2 + home_q1 + home_q2
+                q1_combined = away_q1 + home_q1
+            except (ValueError, IndexError):
+                h1_combined = None
+                q1_combined = None
+
             if closing_total is not None:
                 away_nfl = SBR_TO_NFL.get(away_sbr)
                 home_nfl = SBR_TO_NFL.get(home_sbr)
@@ -135,6 +173,14 @@ def parse_sbr_season(text, season_year):
                     'combined_score': combined,
                     'closing_total':  closing_total,
                     'over':           int(combined > closing_total),
+                    # Second half data for live model validation
+                    'h2_line':        h2_line,
+                    'h2_combined':    h2_combined,
+                    'h1_combined':    h1_combined,
+                    'q1_combined':    q1_combined,
+                    'h2_over':        int(h2_combined > h2_line) if (h2_line and h2_combined is not None) else None,
+                    'q1_pct_of_total': round(q1_combined / closing_total, 4) if (q1_combined is not None and closing_total) else None,
+                    'h1_pct_of_total': round(h1_combined / closing_total, 4) if (h1_combined is not None and closing_total) else None,
                 })
             else:
                 skipped += 1
