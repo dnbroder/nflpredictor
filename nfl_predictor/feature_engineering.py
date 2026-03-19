@@ -270,8 +270,8 @@ def engineer_features(
                 ts_fill = df[["team", "season"]].merge(
                     team_season_medians[[col]].reset_index(),
                     on=["team", "season"], how="left"
-                )[col]
-                df[col] = df[col].fillna(ts_fill.values)
+                )[col].reset_index(drop=True)
+                df[col] = df[col].reset_index(drop=True).fillna(ts_fill)
         # Step 2: global median for any remaining NaN
         for col in pic_cols_present:
             global_median = df[col].median()
