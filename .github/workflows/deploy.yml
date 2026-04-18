@@ -60,6 +60,19 @@ jobs:
             --task-definition nfl-predictor-task-init \
             --query taskDefinition > task-definition.json
 
+      - name: Clean task definition for registration
+        run: |
+          python3 -c "
+          import json
+          with open('task-definition.json') as f:
+              td = json.load(f)
+          for key in ['compatibilities','taskDefinitionArn','requiresAttributes',
+                      'revision','status','registeredAt','registeredBy']:
+              td.pop(key, None)
+          with open('task-definition.json', 'w') as f:
+              json.dump(td, f, indent=2)
+          "
+
       - name: Inject secrets and env vars into task definition
         run: python3 nfl_predictor/patch_task_definition.py task-definition.json
 
