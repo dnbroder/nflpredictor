@@ -4,6 +4,7 @@ Entrypoint for uvicorn (main:app).
 """
 
 import os
+import resource
 import time
 import uuid
 import threading
@@ -19,6 +20,30 @@ from nfl_predictor.__version__ import __version__ as VERSION
 from nfl_predictor.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Memory monitoring — prevents silent OOM kills
+# ---------------------------------------------------------------------------
+def _get_memory_mb() -> float:
+    """Get current process RSS memory in MB."""
+    try:
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+    except Exception:
+        return 0.0
+
+
+def _log_memory(label: str = "") -> float:
+    """Log memory and return MB value."""
+    mem = _get_memory_mb()
+    prefix = f"[MEMORY] {label}: " if label else "[MEMORY] "
+    if mem >= 7000:  # 7GB of 8GB = critical
+        logger.error(f"{prefix}{mem:.1f}MB RSS — CRITICAL (OOM imminent)")
+    elif mem >= 5500:  # ~70% of 8GB
+        logger.warning(f"{prefix}{mem:.1f}MB RSS — WARNING")
+    else:
+        logger.info(f"{prefix}{mem:.1f}MB RSS")
+    return mem
 
 # ---------------------------------------------------------------------------
 # Imports — wrapped individually so any failure is immediately visible in logs
@@ -124,6 +149,7 @@ app.add_middleware(RequestLoggingMiddleware)
 # ---------------------------------------------------------------------------
 @app.on_event("startup")
 async def startup_event():
+    _log_memory("startup_begin")
     logger.info("=" * 60)
     logger.info(f"[STARTUP] NFLPredictor API v{VERSION}")
     logger.info(f"[STARTUP] Environment: {ENVIRONMENT}")
@@ -131,6 +157,7 @@ async def startup_event():
     logger.info(f"[STARTUP] Target:      {TARGET_COLUMN}")
     logger.info(f"[STARTUP] Features:    {len(FEATURE_COLUMNS)}")
     logger.info(f"[STARTUP] Season:      {CURRENT_SEASON}")
+    logger.info(f"[STARTUP] Memory:      8192MB allocated")
     logger.info("=" * 60)
     try:
         result = load_model()
@@ -174,10 +201,12 @@ def root():
 
 @app.get("/health")
 def health():
+    mem = _get_memory_mb()
     return {
         "status": "ok",
         "version": VERSION,
         "environment": ENVIRONMENT,
+        "memory_mb": round(mem, 1),
         "timestamp": datetime.utcnow().isoformat(),
     }
 
@@ -362,29 +391,25 @@ def backtest(
     try:
         train_seasons = list(range(train_start, train_end + 1))
 
-        logger.info(f"[BACKTEST] Step 1/4: Loading train data {train_seasons}...")
-        train_games = load_games(train_seasons)
-        train_drives = load_drives(train_seasons)
-        logger.info(f"[BACKTEST] Train: {len(train_games)} games, {len(train_drives)} drives")
+        logger.info(f"[BACKTEST] Step 1/4: Loading all data for {train_seasons} + [{test_year}]...")
+        all_seasons = train_seasons + [test_year]
+        all_games = load_games(all_seasons)
+        all_drives = load_drives(all_seasons)
+        pbp = load_plays(all_seasons, cache=True)
+        players = load_players(cache=True)
+        logger.info(f"[BACKTEST] Data: {len(all_games)} games, {len(all_drives)} drives, "
+                    f"{len(pbp)} plays, {len(players)} players")
 
-        logger.info(f"[BACKTEST] Step 2/4: Engineering train features...")
-        train_featured = engineer_features(train_games, train_drives)
-        logger.info(f"[BACKTEST] Train features: {len(train_featured)} rows")
-
-        logger.info(f"[BACKTEST] Step 3/4: Training model on {len(train_featured)} rows...")
-        model, metrics = train_model(train_featured)
-        logger.info(f"[BACKTEST] Model trained — AUC={metrics.get('auc_roc')}")
-
-        logger.info(f"[BACKTEST] Step 4/4: Loading test season {test_year}...")
-        test_games = load_games([test_year])
-        all_drives = load_drives(train_seasons + [test_year])
+        logger.info(f"[BACKTEST] Step 2/4: Engineering features (L1+L2+L3)...")
         full_featured = engineer_features(
-            pd.concat([train_games, test_games], ignore_index=True),
-            all_drives,
+            all_games, all_drives,
+            pbp_df=pbp, players_df=players,
         )
-        logger.info(f"[BACKTEST] Running backtest on {test_year}...")
-        results = run_backtest(full_featured, train_start=train_start, train_end=train_end, test_year=test_year)
-        results["train_metrics"] = metrics
+        logger.info(f"[BACKTEST] Features: {len(full_featured)} rows")
+
+        logger.info(f"[BACKTEST] Step 3/4: Running walk-forward backtest...")
+        results = run_backtest(full_featured, train_seasons=train_end - train_start + 1)
+        results["layers"] = "L1+L2+L3"
 
         elapsed = time.time() - t0
         logger.info(f"[BACKTEST] Complete in {elapsed:.1f}s — "
@@ -409,47 +434,61 @@ def backtest_async(
         t0 = time.time()
         logger.info(f"[ASYNC-BACKTEST {job_id}] ========================================")
         logger.info(f"[ASYNC-BACKTEST {job_id}] train={train_start}-{train_end}, test={test_year}")
+        _log_memory(f"backtest_{job_id}_start")
         try:
             train_seasons = list(range(train_start, train_end + 1))
+            all_seasons = train_seasons + [test_year]
 
-            logger.info(f"[ASYNC-BACKTEST {job_id}] Loading train games...")
-            train_games = load_games(train_seasons)
-            logger.info(f"[ASYNC-BACKTEST {job_id}] {len(train_games)} games")
+            logger.info(f"[ASYNC-BACKTEST {job_id}] Loading games...")
+            all_games = load_games(all_seasons)
+            logger.info(f"[ASYNC-BACKTEST {job_id}] {len(all_games)} games")
 
-            logger.info(f"[ASYNC-BACKTEST {job_id}] Loading train drives...")
-            train_drives = load_drives(train_seasons)
-            logger.info(f"[ASYNC-BACKTEST {job_id}] {len(train_drives)} drives")
+            logger.info(f"[ASYNC-BACKTEST {job_id}] Loading drives...")
+            all_drives = load_drives(all_seasons)
+            logger.info(f"[ASYNC-BACKTEST {job_id}] {len(all_drives)} drives")
+            _log_memory(f"backtest_{job_id}_after_drives")
 
-            logger.info(f"[ASYNC-BACKTEST {job_id}] Engineering train features...")
-            train_featured = engineer_features(train_games, train_drives)
-            logger.info(f"[ASYNC-BACKTEST {job_id}] {len(train_featured)} feature rows")
+            logger.info(f"[ASYNC-BACKTEST {job_id}] Loading PBP for Layer 3 PIC...")
+            pbp = load_plays(all_seasons, cache=True)
+            logger.info(f"[ASYNC-BACKTEST {job_id}] {len(pbp)} plays")
+            _log_memory(f"backtest_{job_id}_after_pbp")
 
-            logger.info(f"[ASYNC-BACKTEST {job_id}] Training model...")
-            model, metrics = train_model(train_featured)
-            logger.info(f"[ASYNC-BACKTEST {job_id}] Model trained — AUC={metrics.get('auc_roc')}")
+            logger.info(f"[ASYNC-BACKTEST {job_id}] Loading player identity...")
+            players = load_players(cache=True)
+            logger.info(f"[ASYNC-BACKTEST {job_id}] {len(players)} players")
 
-            logger.info(f"[ASYNC-BACKTEST {job_id}] Loading test season {test_year}...")
-            test_games = load_games([test_year])
-            all_drives = load_drives(train_seasons + [test_year])
+            logger.info(f"[ASYNC-BACKTEST {job_id}] Engineering features (L1+L2+L3)...")
             full_featured = engineer_features(
-                pd.concat([train_games, test_games], ignore_index=True),
-                all_drives,
+                all_games, all_drives,
+                pbp_df=pbp, players_df=players,
             )
-            logger.info(f"[ASYNC-BACKTEST {job_id}] Running backtest...")
-            results = run_backtest(full_featured, train_start=train_start, train_end=train_end, test_year=test_year)
+            logger.info(f"[ASYNC-BACKTEST {job_id}] {len(full_featured)} feature rows")
+            _log_memory(f"backtest_{job_id}_after_features")
+
+            # Free PBP data — no longer needed after feature engineering
+            del pbp
+            _log_memory(f"backtest_{job_id}_pbp_freed")
+
+            logger.info(f"[ASYNC-BACKTEST {job_id}] Running walk-forward backtest...")
+            results = run_backtest(full_featured, train_seasons=train_end - train_start + 1)
 
             elapsed = time.time() - t0
+            mem = _log_memory(f"backtest_{job_id}_complete")
+            summary = results.get("summary", {})
             logger.info(f"[ASYNC-BACKTEST {job_id}] ========================================")
-            logger.info(f"[ASYNC-BACKTEST {job_id}] COMPLETE in {elapsed:.1f}s")
-            logger.info(f"[ASYNC-BACKTEST {job_id}] accuracy={results.get('overall_accuracy')}, "
-                        f"above_breakeven={results.get('above_breakeven')}")
-            for label, data in results.get("confidence_tiers", {}).items():
-                logger.info(f"[ASYNC-BACKTEST {job_id}] Tier {label}: "
-                            f"{data.get('wins')}/{data.get('total')} "
-                            f"acc={data.get('accuracy',0)*100:.1f}% "
-                            f"ROI={data.get('roi',0):+.1%}")
+            logger.info(f"[ASYNC-BACKTEST {job_id}] COMPLETE in {elapsed:.1f}s | peak_mem={mem:.0f}MB")
+            logger.info(f"[ASYNC-BACKTEST {job_id}] Win rate: {summary.get('win_rate', 0):.4f} "
+                        f"(break-even: 0.5238)")
+            logger.info(f"[ASYNC-BACKTEST {job_id}] ROI: {summary.get('overall_roi_pct', 0):+.2f}%")
+            logger.info(f"[ASYNC-BACKTEST {job_id}] Total bets: {summary.get('total_bets', 0)}")
+            for tier, data in summary.get("confidence_tiers", {}).items():
+                if data.get("n", 0) >= 10:
+                    logger.info(f"[ASYNC-BACKTEST {job_id}]   P>={tier}: "
+                                f"win_rate={data['win_rate']:.4f}, "
+                                f"ROI={data['roi_pct']:+.1f}%, n={data['n']}")
             logger.info(f"[ASYNC-BACKTEST {job_id}] ========================================")
         except Exception as e:
+            _log_memory(f"backtest_{job_id}_failed")
             logger.error(f"[ASYNC-BACKTEST {job_id}] FAILED after {time.time()-t0:.1f}s: {e}", exc_info=True)
 
     thread = threading.Thread(target=_run, daemon=True, name=f"backtest-{job_id}")

@@ -219,15 +219,28 @@ if __name__ == "__main__":
     parser.add_argument("--seasons", nargs="+", type=int, default=list(range(2016, 2025)))
     parser.add_argument("--train-window", type=int, default=4)
     parser.add_argument("--min-confidence", type=float, default=0.0)
+    parser.add_argument("--no-pic", action="store_true", help="Skip Layer 3 PIC (faster, L1+L2 only)")
     args = parser.parse_args()
 
-    from nfl_predictor.nfl_data import load_games, load_drives
+    from nfl_predictor.nfl_data import load_games, load_drives, load_plays, load_players
     from nfl_predictor.feature_engineering import engineer_features
 
     logger.info("Loading data...")
     games = load_games(args.seasons)
     drives = load_drives(args.seasons)
-    featured = engineer_features(games, drives, target=args.target)
+
+    # Load PBP + players for Layer 3 PIC (unless --no-pic)
+    pbp = None
+    players = None
+    if not args.no_pic:
+        logger.info("Loading PBP for Layer 3 PIC...")
+        pbp = load_plays(args.seasons)
+        players = load_players()
+        logger.info(f"PBP: {len(pbp)} plays, Players: {len(players)} records")
+    else:
+        logger.info("Skipping Layer 3 PIC (--no-pic flag)")
+
+    featured = engineer_features(games, drives, pbp_df=pbp, players_df=players)
 
     results = run_backtest(featured, target=args.target, train_seasons=args.train_window,
                            min_confidence=args.min_confidence)
