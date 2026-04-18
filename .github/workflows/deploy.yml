@@ -11,9 +11,9 @@ permissions:
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: nfl-predictor
-  ECS_CLUSTER: nfl-predictor-prod
+  ECS_CLUSTER: nfl-predictor-cluster
   ECS_SERVICE: nfl-predictor-service
-  CONTAINER_NAME: nfl-predictor
+  CONTAINER_NAME: app
 
 jobs:
   deploy:
@@ -57,7 +57,7 @@ jobs:
       - name: Download task definition
         run: |
           aws ecs describe-task-definition \
-            --task-definition nfl-predictor-prod \
+            --task-definition nfl-predictor-task-init \
             --query taskDefinition > task-definition.json
 
       - name: Inject secrets and env vars into task definition
