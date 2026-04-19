@@ -14,7 +14,7 @@ env:
   ECS_CLUSTER: nfl-predictor-cluster
   ECS_SERVICE: nfl-predictor-service
   CONTAINER_NAME: app
-  CFN_STACK_NAME: nfl-predictor-stack
+  CFN_STACK_NAME: nfl-predictor
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
@@ -135,14 +135,14 @@ jobs:
       - name: Package and deploy Lambdas
         run: |
           echo "=== Packaging predict-weekly Lambda ==="
-          cd lambda/predict_weekly
-          zip -r /tmp/predict-weekly-lambda.zip handler.py
-          cd ../..
+          cd lambda
+          zip /tmp/predict-weekly-lambda.zip predict_weekly.py
+          cd ..
 
           echo "=== Packaging operations Lambda ==="
-          cd lambda/operations
-          zip -r /tmp/operations-lambda.zip handler.py
-          cd ../..
+          cd lambda
+          zip /tmp/operations-lambda.zip operations.py
+          cd ..
 
           echo "=== Deploying predict-weekly Lambda ==="
           aws lambda update-function-code \
