@@ -1,27 +1,20 @@
 """
-NFL Model — Two-Stage Architecture for Over/Under Prediction.
+NFL Model — Logistic Regression for Over/Under Prediction.
 
-Stage 1: Rule-based filter identifies candidate games where cycle alignment
-         suggests the over is likely (dual optimal, PIC confirmed, etc.)
-Stage 2: Logistic regression scores filtered candidates using the full
-         feature set to produce calibrated probabilities.
+ARCHITECTURE:
+  - Logistic regression on the full feature set produces calibrated
+    probabilities for over/under totals.
+  - Bet decision: probability exceeds the confidence threshold (P>=0.52
+    for over, P<0.48 for under).
+  - Legacy Stage 1 rule filter is computed for monitoring but NOT used
+    to gate bets — it consistently showed negative lift on test sets.
 
 WHY NOT XGBOOST:
   XGBoost with early stopping on AUC collapses to 3-8 trees against a
   closing-line target because individual feature correlations are 0.02-0.08.
   The gradient is too flat for boosting to find a stable path before early
-  stopping kills it. The dual optimal signal (57.9% accuracy, +6.4% lift)
-  is real but sparse (14% of games) — logistic regression handles sparse
-  binary signals better than tree ensembles because it doesn't need to
-  find a split threshold, it just learns a coefficient.
-
-ARCHITECTURE:
-  - Stage 1 filters to games with positive cycle alignment (bet-the-over
-    candidates) or negative alignment (bet-the-under candidates).
-  - Stage 2 logistic regression on the full training set produces
-    calibrated probabilities.
-  - Final bet decision: Stage 1 filter passes AND Stage 2 probability
-    exceeds the confidence threshold.
+  stopping kills it. Logistic regression handles sparse signals better
+  because it doesn't need to find split thresholds.
 """
 
 from nfl_predictor.logger import get_logger
@@ -269,8 +262,8 @@ def train_model(
     X_test = X_test_full[available_features].copy()
     logger.info(f"[MODEL] Split: train={len(X_train)}, test={len(X_test)}")
 
-    # ── Stage 1: Filter evaluation ──
-    logger.info("[MODEL] -- Stage 1: Rule Filter Evaluation --")
+    # ── Stage 1: Filter evaluation (INFORMATIONAL ONLY — not used for betting) ──
+    logger.info("[MODEL] -- Stage 1: Rule Filter Evaluation (informational only) --")
 
     over_mask_train = apply_filter(X_train_full, OVER_FILTER_RULES)
     over_mask_test = apply_filter(X_test_full, OVER_FILTER_RULES)
@@ -464,7 +457,12 @@ def _roi_from_winrate(win_rate: float) -> float:
 # Prediction (production)
 # ---------------------------------------------------------------------------
 def predict(model_package: dict, game_features: pd.DataFrame) -> pd.DataFrame:
-    """Score games using the two-stage model."""
+    """Score games using logistic regression probabilities.
+    
+    Stage 1 rule filter removed — bets are driven purely by the logistic
+    model's calibrated probabilities. Filter signals are still computed
+    and returned as informational columns for monitoring.
+    """
     lr_model = model_package["logistic_model"]
     scaler = model_package["scaler"]
     features = model_package["logistic_features"]
@@ -477,6 +475,7 @@ def predict(model_package: dict, game_features: pd.DataFrame) -> pd.DataFrame:
     X_scaled = scaler.transform(X)
     proba = lr_model.predict_proba(X_scaled)[:, 1]
 
+    # Filter signals kept as informational columns only
     over_mask = apply_filter(game_features, model_package.get("over_filter_rules", OVER_FILTER_RULES))
     under_mask = apply_filter(game_features, model_package.get("under_filter_rules", UNDER_FILTER_RULES))
     boost = compute_boost_score(game_features, model_package.get("over_boost_signals", OVER_BOOST_SIGNALS))
@@ -488,9 +487,10 @@ def predict(model_package: dict, game_features: pd.DataFrame) -> pd.DataFrame:
         "boost_score": boost,
     }, index=game_features.index)
 
+    # Bet purely on logistic probability — no filter gating
     result["bet_recommendation"] = "no_bet"
-    result.loc[over_mask & (proba >= 0.50), "bet_recommendation"] = "over"
-    result.loc[under_mask & (proba < 0.50), "bet_recommendation"] = "under"
+    result.loc[proba >= 0.52, "bet_recommendation"] = "over"
+    result.loc[proba < 0.48, "bet_recommendation"] = "under"
 
     return result
 

@@ -544,15 +544,36 @@ def tune_async(
         logger.info(f"[ASYNC-TUNE {job_id}] Starting: train={train_start}-{train_end}, n_iter={n_iter}")
         try:
             seasons = list(range(train_start, train_end + 1))
+
+            logger.info(f"[ASYNC-TUNE {job_id}] Loading full data pipeline...")
             games = load_games(seasons)
             drives = load_drives(seasons)
-            featured = engineer_features(games, drives)
+            pbp = load_plays(seasons, cache=True)
+            players = load_players(cache=True)
+            closing_lines = load_closing_lines(seasons, cache=True)
+            epa = load_epa_by_game(seasons, cache=True)
+            qb = load_qb_stats(seasons, cache=True)
+
+            n_cl = len(closing_lines) if closing_lines is not None and not closing_lines.empty else 0
+            n_epa = len(epa) if epa is not None and not epa.empty else 0
+            n_qb = len(qb) if qb is not None and not qb.empty else 0
+            logger.info(f"[ASYNC-TUNE {job_id}] Data: {len(games)} games, {n_cl} closing lines, "
+                        f"{n_epa} EPA, {n_qb} QB, {len(pbp)} plays")
+
+            featured = engineer_features(
+                games, drives,
+                pbp_df=pbp, players_df=players,
+                closing_lines_df=closing_lines,
+                epa_df=epa, qb_df=qb,
+            )
+            del pbp  # free memory
+
             logger.info(f"[ASYNC-TUNE {job_id}] {len(featured)} rows — starting {n_iter} iterations...")
             results = tune_hyperparameters(featured, n_iter=n_iter)
             elapsed = time.time() - t0
             logger.info(f"[ASYNC-TUNE {job_id}] Complete in {elapsed:.1f}s — "
-                        f"best={results['best']['mean_accuracy']:.4f} "
-                        f"improvement={results['best']['improvement']:+.4f}")
+                        f"best C={results['best']['C']:.6f}, "
+                        f"AUC={results['best']['mean_auc']:.4f}")
         except Exception as e:
             logger.error(f"[ASYNC-TUNE {job_id}] FAILED: {e}", exc_info=True)
 
@@ -577,7 +598,18 @@ def shap_async(
             seasons = list(range(train_start, train_end + 1))
             games = load_games(seasons)
             drives = load_drives(seasons)
-            featured = engineer_features(games, drives)
+            pbp = load_plays(seasons, cache=True)
+            players = load_players(cache=True)
+            closing_lines = load_closing_lines(seasons, cache=True)
+            epa = load_epa_by_game(seasons, cache=True)
+            qb = load_qb_stats(seasons, cache=True)
+            featured = engineer_features(
+                games, drives,
+                pbp_df=pbp, players_df=players,
+                closing_lines_df=closing_lines,
+                epa_df=epa, qb_df=qb,
+            )
+            del pbp
             logger.info(f"[ASYNC-SHAP {job_id}] {len(featured)} rows — running SHAP...")
             run_shap_analysis(featured)
             elapsed = time.time() - t0
