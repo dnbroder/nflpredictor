@@ -1,0 +1,59 @@
+name: Update Live Results
+
+on:
+  schedule:
+    # Tuesday 12 PM ET (16:00 UTC) — after accuracy check Lambda runs at 7am ET
+    # Only relevant Sep-Feb but GitHub Actions doesn't support month-scoped cron,
+    # so the Python script exits cleanly when there's no data to update.
+    - cron: '0 16 * * TUE'
+  workflow_dispatch:  # manual trigger anytime
+
+permissions:
+  id-token: write
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+# Prevent two scheduled runs from racing each other on the same README file.
+concurrency:
+  group: update-live-results
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/mlb-cicd-role
+          aws-region: us-east-1
+          role-session-name: github-actions-update-nfl-results
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install boto3
+
+      - name: Fetch latest results and update README
+        run: python3 scripts/update_readme_results.py
+
+      - name: Commit updated README
+        run: |
+          git config user.name "NFL Predictor Bot"
+          git config user.email "bot@dandoesdfs.com"
+          git add README.md
+          if git diff --staged --quiet; then
+            echo "No README changes to commit."
+          else
+            git commit -m "chore: update live season results [skip ci]"
+            git push
+          fi

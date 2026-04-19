@@ -14,6 +14,8 @@ env:
   ECS_CLUSTER: nfl-predictor-cluster
   ECS_SERVICE: nfl-predictor-service
   CONTAINER_NAME: app
+  CFN_STACK_NAME: nfl-predictor-stack
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   deploy:
@@ -27,24 +29,41 @@ jobs:
           git config --global advice.defaultBranchName false
 
       - name: Checkout
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v5
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3.10.0
+        uses: docker/setup-buildx-action@v4
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4.1.0
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/mlb-cicd-role
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2.0.1
+        uses: aws-actions/amazon-ecr-login@v2
 
+      # ---------------------------------------------------------------
+      # Step 1: CloudFormation — update infrastructure first
+      # ---------------------------------------------------------------
+      - name: Deploy CloudFormation stack
+        run: |
+          echo "Deploying CloudFormation stack: ${{ env.CFN_STACK_NAME }}"
+          aws cloudformation deploy \
+            --stack-name ${{ env.CFN_STACK_NAME }} \
+            --template-file infrastructure.yaml \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
+            --region ${{ env.AWS_REGION }}
+          echo "CloudFormation stack update complete"
+
+      # ---------------------------------------------------------------
+      # Step 2: Build and push Docker image
+      # ---------------------------------------------------------------
       - name: Build, tag, and push image
         id: build-image
-        uses: docker/build-push-action@v6.15.0
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
@@ -54,6 +73,9 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # ---------------------------------------------------------------
+      # Step 3: Update ECS task definition and deploy
+      # ---------------------------------------------------------------
       - name: Download task definition
         run: |
           aws ecs describe-task-definition \
@@ -93,19 +115,59 @@ jobs:
 
       - name: Update task definition
         id: task-def
-        uses: aws-actions/amazon-ecs-render-task-definition@v1.4.0
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
           task-definition: task-definition.json
           container-name: ${{ env.CONTAINER_NAME }}
           image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
 
       - name: Deploy to ECS
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v2.3.0
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
           task-definition: ${{ steps.task-def.outputs.task-definition }}
           service: ${{ env.ECS_SERVICE }}
           cluster: ${{ env.ECS_CLUSTER }}
           wait-for-service-stability: true
 
+      # ---------------------------------------------------------------
+      # Step 4: Deploy Lambda function code
+      # ---------------------------------------------------------------
+      - name: Package and deploy Lambdas
+        run: |
+          echo "=== Packaging predict-weekly Lambda ==="
+          cd lambda/predict_weekly
+          zip -r /tmp/predict-weekly-lambda.zip handler.py
+          cd ../..
+
+          echo "=== Packaging operations Lambda ==="
+          cd lambda/operations
+          zip -r /tmp/operations-lambda.zip handler.py
+          cd ../..
+
+          echo "=== Deploying predict-weekly Lambda ==="
+          aws lambda update-function-code \
+            --function-name ${{ env.ECR_REPOSITORY }}-predict-weekly \
+            --zip-file fileb:///tmp/predict-weekly-lambda.zip \
+            --region ${{ env.AWS_REGION }} \
+            --publish
+
+          echo "=== Deploying operations Lambda ==="
+          aws lambda update-function-code \
+            --function-name ${{ env.ECR_REPOSITORY }}-operations \
+            --zip-file fileb:///tmp/operations-lambda.zip \
+            --region ${{ env.AWS_REGION }} \
+            --publish
+
+          echo "Both Lambdas deployed"
+
+      # ---------------------------------------------------------------
+      # Step 5: Verify deployment
+      # ---------------------------------------------------------------
       - name: Deployment complete
-        run: echo "ECS service stable — new container is live"
+        run: |
+          echo "========================================="
+          echo "NFL Predictor deployment complete"
+          echo "  CloudFormation: ${{ env.CFN_STACK_NAME }}"
+          echo "  ECS: ${{ env.ECS_CLUSTER }}/${{ env.ECS_SERVICE }}"
+          echo "  Lambda: ${{ env.ECR_REPOSITORY }}-predict-weekly"
+          echo "========================================="

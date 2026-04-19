@@ -627,86 +627,134 @@ def shap_async(
 def predict_week(
     week: int,
     season: int = Query(default=CURRENT_SEASON),
-    min_confidence: float = Query(default=0.0),
+    min_confidence: float = Query(default=0.52),
 ):
-    """All game predictions for a given week, sorted by confidence."""
+    """Production predictions for a given week.
+    
+    Loads saved model from S3, fetches current season data,
+    engineers full L1+L2+L3+EPA+QB features, and returns
+    calibrated predictions sorted by confidence.
+    
+    Output format is designed for dandoesdfs.com API consumption.
+    """
+    logger.info(f"[PREDICT] ========================================")
     logger.info(f"[PREDICT] week={week}, season={season}, min_confidence={min_confidence}")
     t0 = time.time()
     try:
-        model, feature_cols, calibrator = load_model()
-        if model is None:
+        # Load saved model package (includes calibrated_model, scaler, medians)
+        model_pkg, feature_cols, _ = load_model()
+        if model_pkg is None:
             logger.warning("[PREDICT] No model available")
             return JSONResponse(status_code=404, content={"error": "No model. Run /train first."})
-        cal_status = "with calibrator" if calibrator else "raw probabilities"
-        logger.info(f"[PREDICT] Model loaded ({len(feature_cols)} features, {cal_status})")
+        
+        has_calibrator = "calibrated_model" in model_pkg if isinstance(model_pkg, dict) else False
+        logger.info(f"[PREDICT] Model loaded — {'calibrated' if has_calibrator else 'raw'}")
 
-        games = load_games([season])
-        week_games = games[games["week"] == week]
-        logger.info(f"[PREDICT] Week {week}: {len(week_games)} games")
+        # Load full data pipeline for current season
+        # Need prior seasons for rolling features (P2S cycles etc)
+        prior_seasons = list(range(max(season - 5, 2016), season))
+        all_seasons = prior_seasons + [season]
+        logger.info(f"[PREDICT] Loading data for seasons {all_seasons}")
 
-        if week_games.empty:
-            logger.warning(f"[PREDICT] No games found for week={week} season={season}")
-            return {"week": week, "season": season, "predictions": []}
+        games = load_games(all_seasons, cache=True)
+        drives = load_drives(all_seasons, cache=True)
+        pbp = load_plays(all_seasons, cache=True)
+        players = load_players(cache=True)
+        closing_lines = load_closing_lines(all_seasons, cache=True)
+        epa = load_epa_by_game(all_seasons, cache=True)
+        qb = load_qb_stats(all_seasons, cache=True)
 
-        drives = load_drives([season])
-        featured = engineer_features(week_games, drives)
+        logger.info(f"[PREDICT] Data loaded: {len(games)} games, {len(drives)} drives")
 
-        missing_cols = [f for f in feature_cols if f not in featured.columns]
-        if missing_cols:
-            logger.warning(f"[PREDICT] {len(missing_cols)} missing features filled with 0: {missing_cols}")
-            for col in missing_cols:
-                featured[col] = 0.0
-
-        available = [f for f in feature_cols if f in featured.columns]
-        X = featured[available]
-        logger.info(f"[PREDICT] Predicting {len(X)} rows with {len(available)} features...")
-
-        raw_proba = model.predict_proba(X)[:, 1]
-        if calibrator is not None:
-            y_proba = calibrator.predict(raw_proba)
-            logger.info(f"[PREDICT] Calibrated — raw mean={raw_proba.mean():.3f}, "
-                       f"calibrated mean={y_proba.mean():.3f}")
-        else:
-            y_proba = raw_proba
-        y_pred = (y_proba >= 0.5).astype(int)
-        confidences = np.maximum(y_proba, 1 - y_proba)
-
-        featured = featured.copy()
-        featured["probability"] = y_proba
-        featured["confidence"] = confidences
-        featured["prediction"] = y_pred
-
-        filtered = featured[featured["confidence"] >= min_confidence].sort_values(
-            "confidence", ascending=False
+        # Engineer features for all games (rolling features need full history)
+        featured = engineer_features(
+            games, drives,
+            pbp_df=pbp, players_df=players,
+            closing_lines_df=closing_lines,
+            epa_df=epa, qb_df=qb,
         )
+        logger.info(f"[PREDICT] {len(featured)} total feature rows")
+
+        # Filter to just the requested week
+        week_mask = (featured["season"] == season) & (featured["week"] == week)
+        week_data = featured[week_mask].copy()
+        logger.info(f"[PREDICT] Week {week}: {len(week_data)} game-team rows")
+
+        if week_data.empty:
+            return {"week": week, "season": season, "predictions": [], "n_games": 0}
+
+        # Score with the model
+        from nfl_predictor.model import predict
+        predictions = predict(model_pkg, week_data)
+        week_data = week_data.join(predictions)
+
+        # Build output — one row per GAME (not per team)
+        # Group by game_id, take the home team's perspective
+        home_rows = week_data[week_data.get("is_home", pd.Series([0]*len(week_data))) == 1]
+        away_rows = week_data[week_data.get("is_home", pd.Series([0]*len(week_data))) == 0]
 
         results = []
-        for _, row in filtered.iterrows():
+        game_ids_seen = set()
+        for _, row in week_data.iterrows():
+            gid = row.get("game_id", "")
+            if gid in game_ids_seen:
+                continue
+            game_ids_seen.add(gid)
+
+            prob = float(row.get("over_probability", 0.5))
+            direction = "OVER" if prob >= 0.5 else "UNDER"
+            confidence = max(prob, 1 - prob)
+            
+            # Confidence tier
+            if confidence >= 0.55:
+                tier = "CONVICTION"
+            elif confidence >= 0.53:
+                tier = "HIGH"
+            elif confidence >= 0.52:
+                tier = "STANDARD"
+            else:
+                tier = "LEAN"
+
+            # Skip games below min confidence
+            if confidence < min_confidence:
+                continue
+
             results.append(_sanitize({
-                "team":          row.get("team"),
-                "opponent":      row.get("opponent"),
-                "is_home":       bool(row.get("is_home", 0)),
-                "prediction":    int(row["prediction"]),
-                "probability":   round(float(row["probability"]), 4),
-                "confidence":    round(float(row["confidence"]), 4),
-                "dual_optimal":  bool(row.get("p2s_p2sz_dual_optimal", 0) == 1.0),
-                "p2s_ratio":     round(float(row.get("p2s_ratio") or 0), 3),
-                "p2sz_sp_ratio": round(float(row.get("p2sz_sp_ratio") or 0), 3),
+                "game_id": gid,
+                "home_team": str(row.get("team", "")),
+                "away_team": str(row.get("opponent", "")),
+                "direction": direction,
+                "over_probability": round(prob, 4),
+                "confidence": round(confidence, 4),
+                "tier": tier,
+                "opening_total": round(float(row.get("opening_total", 0)), 1),
+                "closing_total": round(float(row.get("closing_total", 0) or row.get("opening_total", 0)), 1),
+                "is_dome": bool(row.get("is_dome", 0)),
+                "wind_mph": round(float(row.get("wind_mph", 0) or 0), 0),
+                "temp": round(float(row.get("temp", 0) or 0), 0),
+                # Cycle diagnostics for transparency
+                "p2s_ratio": round(float(row.get("p2s_ratio") or 0), 3),
+                "dual_optimal": bool(row.get("p2s_p2sz_dual_optimal", 0) == 1.0),
+                "pic_qb_in_zone": bool(row.get("pic_qb_in_zone", 0) > 0),
             }))
 
+        # Sort by confidence descending
+        results.sort(key=lambda x: x["confidence"], reverse=True)
+
         elapsed = time.time() - t0
-        above_55 = sum(1 for r in results if r["confidence"] >= 0.55)
-        dual_opt = sum(1 for r in results if r["dual_optimal"])
-        logger.info(f"[PREDICT] {len(results)} predictions in {elapsed:.1f}s — "
-                    f"{above_55} at 55%+ confidence, {dual_opt} dual optimal")
+        conviction = sum(1 for r in results if r["tier"] == "CONVICTION")
+        high = sum(1 for r in results if r["tier"] == "HIGH")
+        logger.info(f"[PREDICT] {len(results)} picks in {elapsed:.1f}s — "
+                    f"{conviction} CONVICTION, {high} HIGH")
+        logger.info(f"[PREDICT] ========================================")
 
         return {
             "week": week,
             "season": season,
-            "target": TARGET_COLUMN,
-            "n_games": len(results),
-            "high_confidence": above_55,
-            "dual_optimal": dual_opt,
+            "model_version": "v2.0_calibrated",
+            "n_predictions": len(results),
+            "conviction_picks": conviction,
+            "high_picks": high,
             "elapsed_seconds": round(elapsed, 1),
             "predictions": results,
         }

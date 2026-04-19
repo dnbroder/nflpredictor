@@ -217,12 +217,384 @@ Resources:
       BucketName: !Sub "${AppName}-bucket"
       VersioningConfiguration:
         Status: Enabled
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ["*"]
+            AllowedMethods: [GET]
+            AllowedOrigins:
+              - "https://dandoesdfs.com"
+              - "https://www.dandoesdfs.com"
+              - "http://localhost:3000"
+            MaxAge: 3600
       LifecycleConfiguration:
         Rules:
           - Id: ExpireOldDataCache
             Prefix: data/
             Status: Enabled
             ExpirationInDays: 90
+
+  # -----------------------------------------------------------------------
+  # Lambda Execution Role
+  # -----------------------------------------------------------------------
+  PredictLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-predict-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PredictLambdaAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${AppName}-bucket/predictions/*"
+              - Effect: Allow
+                Action:
+                  - ecs:ListTasks
+                  - ecs:DescribeTasks
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeNetworkInterfaces
+                Resource: "*"
+
+  # -----------------------------------------------------------------------
+  # Weekly Predictions Lambda
+  # -----------------------------------------------------------------------
+  PredictWeeklyLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AppName}-predict-weekly"
+      Runtime: python3.12
+      Handler: handler.handler
+      Role: !GetAtt PredictLambdaRole.Arn
+      Timeout: 900
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          # Placeholder — deploy actual code via CI/CD
+          def handler(event, context):
+              return {"statusCode": 200, "body": "deploy lambda/predict_weekly/handler.py"}
+      Environment:
+        Variables:
+          ECS_CLUSTER: !Sub "${AppName}-cluster"
+          ECS_SERVICE: !Sub "${AppName}-service"
+          S3_BUCKET: !Sub "${AppName}-bucket"
+          NFL_SEASON: "2026"
+          CONTAINER_PORT: !Ref ContainerPort
+
+  # -----------------------------------------------------------------------
+  # EventBridge: Tuesday TNF Predictions (10:00 AM ET = 14:00 UTC)
+  # Runs Sep-Feb only (NFL regular season + playoffs)
+  # -----------------------------------------------------------------------
+  TNFScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AppName}-tnf-predictions"
+      Description: "Generate Thursday Night Football predictions every Tuesday at 10am ET (Sep-Feb)"
+      ScheduleExpression: "cron(0 14 ? 9-12,1-2 TUE *)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt PredictWeeklyLambda.Arn
+          Id: TNFTarget
+          Input: '{"slate": "TNF"}'
+
+  TNFSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PredictWeeklyLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt TNFScheduleRule.Arn
+
+  # -----------------------------------------------------------------------
+  # EventBridge: Saturday Full Slate Predictions (8:00 AM ET = 12:00 UTC)
+  # Runs Sep-Feb only (NFL regular season + playoffs)
+  # -----------------------------------------------------------------------
+  SundaySlateScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AppName}-sunday-slate-predictions"
+      Description: "Generate full Sunday/Monday slate predictions every Saturday at 8am ET (Sep-Feb)"
+      ScheduleExpression: "cron(0 12 ? 9-12,1-2 SAT *)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt PredictWeeklyLambda.Arn
+          Id: SundaySlateTarget
+          Input: '{"slate": "SUNDAY"}'
+
+  SundaySlateSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PredictWeeklyLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SundaySlateScheduleRule.Arn
+
+  # -----------------------------------------------------------------------
+  # EventBridge: Preseason Retrain (August 15 each year, 6:00 AM ET)
+  # -----------------------------------------------------------------------
+  RetrainScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AppName}-preseason-retrain"
+      Description: "Retrain model on latest 6 seasons before each NFL season"
+      ScheduleExpression: "cron(0 10 15 8 ? *)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt OperationsLambda.Arn
+          Id: RetrainTarget
+          Input: '{"action": "retrain"}'
+
+  RetrainSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OperationsLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RetrainScheduleRule.Arn
+
+  # -----------------------------------------------------------------------
+  # EventBridge: Wednesday Data Refresh (6:00 AM ET = 10:00 UTC)
+  # Warms S3 caches with latest game data before Saturday predictions
+  # Runs Sep-Feb only (NFL regular season + playoffs)
+  # -----------------------------------------------------------------------
+  DataRefreshScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AppName}-data-refresh"
+      Description: "Weekly data cache refresh every Wednesday at 6am ET (Sep-Feb)"
+      ScheduleExpression: "cron(0 10 ? 9-12,1-2 WED *)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt OperationsLambda.Arn
+          Id: DataRefreshTarget
+          Input: '{"action": "refresh"}'
+
+  DataRefreshSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OperationsLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DataRefreshScheduleRule.Arn
+
+  # -----------------------------------------------------------------------
+  # EventBridge: Tuesday Accuracy Check (7:00 AM ET = 11:00 UTC)
+  # Compares last week's predictions to actual results
+  # Runs Sep-Feb only (NFL regular season + playoffs)
+  # -----------------------------------------------------------------------
+  AccuracyCheckScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AppName}-accuracy-check"
+      Description: "Post-game accuracy check every Tuesday at 7am ET (Sep-Feb)"
+      ScheduleExpression: "cron(0 11 ? 9-12,1-2 TUE *)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt OperationsLambda.Arn
+          Id: AccuracyCheckTarget
+          Input: '{"action": "accuracy"}'
+
+  AccuracyCheckSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OperationsLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AccuracyCheckScheduleRule.Arn
+
+  # -----------------------------------------------------------------------
+  # Operations Lambda (retrain, refresh, accuracy)
+  # -----------------------------------------------------------------------
+  OperationsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AppName}-operations"
+      Runtime: python3.12
+      Handler: handler.handler
+      Role: !GetAtt OperationsLambdaRole.Arn
+      Timeout: 900
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          # Placeholder — deploy actual code via CI/CD
+          def handler(event, context):
+              return {"statusCode": 200, "body": "deploy lambda/operations/handler.py"}
+      Environment:
+        Variables:
+          ECS_CLUSTER: !Sub "${AppName}-cluster"
+          ECS_SERVICE: !Sub "${AppName}-service"
+          S3_BUCKET: !Sub "${AppName}-bucket"
+          NFL_SEASON: "2026"
+          CONTAINER_PORT: !Ref ContainerPort
+
+  OperationsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-operations-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: OperationsLambdaAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${AppName}-bucket/logs/*"
+                  - !Sub "arn:aws:s3:::${AppName}-bucket/predictions/*"
+                  - !Sub "arn:aws:s3:::${AppName}-bucket/accuracy/*"
+              - Effect: Allow
+                Action:
+                  - ecs:ListTasks
+                  - ecs:DescribeTasks
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeNetworkInterfaces
+                Resource: "*"
+
+  # -----------------------------------------------------------------------
+  # API Gateway — REST API for dandoesdfs.com
+  # -----------------------------------------------------------------------
+  PredictionsApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${AppName}-api"
+      Description: "Public API for NFL predictions — dandoesdfs.com"
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # /nfl resource
+  ApiNflResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PredictionsApi
+      ParentId: !GetAtt PredictionsApi.RootResourceId
+      PathPart: nfl
+
+  # /nfl/picks resource
+  ApiPicksResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PredictionsApi
+      ParentId: !Ref ApiNflResource
+      PathPart: picks
+
+  # GET /nfl/picks — returns latest predictions from S3
+  ApiPicksMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PredictionsApi
+      ResourceId: !Ref ApiPicksResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: GET
+        Credentials: !GetAtt ApiGatewayS3Role.Arn
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:s3:path/${AppName}-bucket/predictions/nfl_latest.json"
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Content-Type: "'application/json'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        PassthroughBehavior: WHEN_NO_MATCH
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Content-Type: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # CORS OPTIONS for /nfl/picks
+  ApiPicksOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PredictionsApi
+      ResourceId: !Ref ApiPicksResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ""
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # IAM role for API Gateway to read S3
+  ApiGatewayS3Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-apigw-s3-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3ReadPredictions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${AppName}-bucket/predictions/*"
+
+  # Deploy the API
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiPicksMethod
+      - ApiPicksOptionsMethod
+    Properties:
+      RestApiId: !Ref PredictionsApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref PredictionsApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: v1
 
 Outputs:
   ECRRepositoryUri:
@@ -234,3 +606,27 @@ Outputs:
     Value: !GetAtt ECSService.Name
   S3BucketName:
     Value: !Ref ModelBucket
+  PredictionsApiUrl:
+    Value: !Sub "https://${PredictionsApi}.execute-api.${AWS::Region}.amazonaws.com/v1/nfl/picks"
+    Description: Public API endpoint for NFL predictions
+  PredictWeeklyLambda:
+    Value: !Ref PredictWeeklyLambda
+    Description: Lambda for weekly predictions
+  OperationsLambda:
+    Value: !Ref OperationsLambda
+    Description: Lambda for retrain, refresh, accuracy
+  TNFScheduleRule:
+    Value: !Ref TNFScheduleRule
+    Description: Tuesday TNF predictions
+  SundaySlateScheduleRule:
+    Value: !Ref SundaySlateScheduleRule
+    Description: Saturday full-slate predictions
+  RetrainScheduleRule:
+    Value: !Ref RetrainScheduleRule
+    Description: August 15 preseason retrain
+  DataRefreshScheduleRule:
+    Value: !Ref DataRefreshScheduleRule
+    Description: Wednesday data cache refresh
+  AccuracyCheckScheduleRule:
+    Value: !Ref AccuracyCheckScheduleRule
+    Description: Tuesday post-game accuracy check

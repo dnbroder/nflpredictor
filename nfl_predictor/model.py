@@ -255,31 +255,12 @@ def train_model(
 
     # Train/test split
     X_full = featured_data[all_features].copy()
-    # Preserve season for recency weighting before split
-    train_seasons_col = featured_data["season"].copy() if "season" in featured_data.columns else None
     X_train_full, X_test_full, y_train, y_test = train_test_split(
         X_full, y, test_size=test_size, random_state=random_state, stratify=y,
     )
     X_train = X_train_full[available_features].copy()
     X_test = X_test_full[available_features].copy()
     logger.info(f"[MODEL] Split: train={len(X_train)}, test={len(X_test)}")
-
-    # ── Recency weighting ──
-    # Recent seasons predict the current season better than older ones.
-    # Weight decays linearly: most recent season = 1.0, oldest = 0.4.
-    sample_weights = None
-    if train_seasons_col is not None:
-        train_season_values = train_seasons_col.loc[X_train_full.index]
-        max_season = train_season_values.max()
-        min_season = train_season_values.min()
-        season_range = max(max_season - min_season, 1)
-        # Linear decay: newest=1.0, oldest=0.4
-        sample_weights = 0.4 + 0.6 * (train_season_values - min_season) / season_range
-        sample_weights = sample_weights.values
-        logger.info(f"[MODEL] Recency weighting: seasons {min_season}-{max_season}, "
-                   f"weights {sample_weights.min():.2f}-{sample_weights.max():.2f}")
-    else:
-        logger.warning("[MODEL] No season column — recency weighting disabled")
 
     # ── Stage 1: Filter evaluation (INFORMATIONAL ONLY — not used for betting) ──
     logger.info("[MODEL] -- Stage 1: Rule Filter Evaluation (informational only) --")
@@ -328,7 +309,7 @@ def train_model(
     lr_model = LogisticRegression(
         C=0.034, penalty="l2", solver="lbfgs", max_iter=1000, random_state=random_state,
     )
-    lr_model.fit(X_train_scaled, y_train, sample_weight=sample_weights)
+    lr_model.fit(X_train_scaled, y_train)
 
     train_elapsed = _time.time() - train_start
     logger.info(f"[MODEL] Logistic regression trained in {train_elapsed:.2f}s")
@@ -341,7 +322,7 @@ def train_model(
     calibrated_model = CalibratedClassifierCV(
         lr_model, cv=3, method="sigmoid",
     )
-    calibrated_model.fit(X_train_scaled, y_train, sample_weight=sample_weights)
+    calibrated_model.fit(X_train_scaled, y_train)
     logger.info("[MODEL] Platt scaling calibration fitted (sigmoid, 3-fold CV)")
 
     # Coefficients
