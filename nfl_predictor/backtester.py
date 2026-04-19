@@ -63,8 +63,7 @@ def run_backtest(featured_data, target="over_total", train_seasons=4, test_seaso
                     f"({len(train_data)} train, {len(test_data)} test)")
 
         try:
-            model, train_metrics = train_model(train_data, target=target, calibrate=True,
-                                               random_state=random_state)
+            model, train_metrics = train_model(train_data, random_state=random_state)
         except Exception as e:
             logger.error(f"[BT] Training failed: {e}")
             continue
