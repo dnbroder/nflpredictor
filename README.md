@@ -135,7 +135,7 @@ s3://nfl-predictor-bucket/
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        DEVELOPER WORKFLOW                           │
 │  VS Code ──► GitHub (main) ──► GitHub Actions                       │
-│              │                  ├── CloudFormation (infra)           │
+│              │                  ├── CloudFormation (infra)          │
 │              │                  ├── ECR (Docker image)               │
 │              │                  ├── ECS Fargate (rolling deploy)     │
 │              │                  └── Lambda (code deploy)             │
