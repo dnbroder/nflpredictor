@@ -859,28 +859,34 @@ def load_sbr_closing_lines(seasons, s3_client=None, bucket=None):
             if key_flip not in sched_lookup:
                 sched_lookup[key_flip] = (row["game_id"], row.get("week"))
 
-        # SBR team abbreviation fixes for edge cases not in main map.
-        # NOTE: Do NOT remap OAK→LV or SD→LAC here — for 2016-2019,
-        # the nflfastR schedule uses the original abbreviations (OAK, SD).
-        # The schedule lookup already has the correct historical keys.
-        SBR_FIXUPS = {
-            "JAC": "JAX",   # SBR sometimes uses JAC
-            "HST": "HOU",   # SBR Houston
-            "CLV": "CLE",   # SBR Cleveland
-            "ARZ": "ARI",   # SBR Arizona
-            "SL":  "STL",   # SBR St. Louis → nflfastR STL (pre-2016)
-        }
+        # Era-aware abbreviation fixups for SBR data.
+        # The existing SBR parquet uses MODERN abbreviations (LV, LAC, LAR)
+        # but nflfastR schedule uses HISTORICAL ones (OAK, SD, STL).
+        # This function converts SBR abbreviations to match the schedule.
+        def _sbr_fixup(abbr: str, season: int) -> str:
+            # Static fixups
+            static = {"JAC": "JAX", "HST": "HOU", "CLV": "CLE", "ARZ": "ARI", "SL": "STL"}
+            abbr = static.get(abbr, abbr)
+            # Era-aware relocated teams
+            if abbr == "LV" and season <= 2019:
+                return "OAK"
+            if abbr == "LAC" and season <= 2016:
+                return "SD"
+            if abbr == "LAR" and season <= 2015:
+                return "STL"
+            return abbr
 
         rows = []
         missed = []
         for _, sbr_row in df.iterrows():
-            away = SBR_FIXUPS.get(str(sbr_row["away_team"]), str(sbr_row["away_team"]))
-            home = SBR_FIXUPS.get(str(sbr_row["home_team"]), str(sbr_row["home_team"]))
-            key = (int(sbr_row["season"]), away, home)
+            season = int(sbr_row["season"])
+            away = _sbr_fixup(str(sbr_row["away_team"]), season)
+            home = _sbr_fixup(str(sbr_row["home_team"]), season)
+            key = (season, away, home)
             match = sched_lookup.get(key)
             # Try original if fixup didn't help
             if not match:
-                key_orig = (int(sbr_row["season"]), str(sbr_row["away_team"]), str(sbr_row["home_team"]))
+                key_orig = (season, str(sbr_row["away_team"]), str(sbr_row["home_team"]))
                 match = sched_lookup.get(key_orig)
             if match:
                 game_id, week = match

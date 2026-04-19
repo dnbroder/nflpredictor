@@ -63,14 +63,31 @@ def run_backtest(featured_data, target="over_total", train_seasons=4, test_seaso
                     f"({len(train_data)} train, {len(test_data)} test)")
 
         try:
-            model, train_metrics = train_model(train_data, random_state=random_state)
+            model_result, train_metrics = train_model(train_data, random_state=random_state)
         except Exception as e:
             logger.error(f"[BT] Training failed: {e}")
             continue
 
         X_test = test_data[available].copy()
         y_test = test_data[target_col].values
-        y_proba = model.predict_proba(X_test)[:, 1]
+
+        # Support both two-stage (dict with logistic_model) and legacy XGBoost
+        if isinstance(model_result, dict) and "logistic_model" in model_result:
+            # Two-stage model: use logistic regression for probabilities
+            lr = model_result["logistic_model"]
+            lr_features = model_result["logistic_features"]
+            lr_scaler = model_result["scaler"]
+            medians = model_result.get("train_medians", {})
+            X_lr = test_data[[f for f in lr_features if f in test_data.columns]].copy()
+            for col in X_lr.columns:
+                if col in medians:
+                    X_lr[col] = X_lr[col].fillna(medians[col])
+            X_lr_scaled = lr_scaler.transform(X_lr)
+            y_proba = lr.predict_proba(X_lr_scaled)[:, 1]
+        else:
+            # Legacy XGBoost
+            y_proba = model_result.predict_proba(X_test)[:, 1]
+
         y_pred = (y_proba >= 0.5).astype(int)
 
         clv_values = _compute_clv(test_data, y_proba, target)

@@ -20,44 +20,67 @@ import os
 import boto3
 
 # SBR team name → nfl_data_py abbreviation
-# Covers all name variations 2013-2019 including franchise moves
-SBR_TO_NFL = {
+# IMPORTANT: nflfastR uses HISTORICAL abbreviations for relocated teams:
+#   OAK (not LV) for Oakland through 2019
+#   SD  (not LAC) for San Diego through 2016
+#   STL (not LAR) for St. Louis through 2015
+#   LAR for LA Rams 2016+
+#   LAC for LA Chargers 2017+
+#   LV  for Las Vegas 2020+
+#
+# This base map covers teams that NEVER moved. Relocated teams are handled
+# by sbr_to_nfl() which applies era-aware logic.
+SBR_TO_NFL_BASE = {
     # AFC East
-    'Buffalo': 'BUF', 'Miami': 'MIA', 'NewEngland': 'NE', 'NYJets': 'NYJ',
+    'Buffalo': 'BUF', 'BuffaloBills': 'BUF', 'Miami': 'MIA',
+    'NewEngland': 'NE', 'NYJets': 'NYJ', 'NewYorkJets': 'NYJ',
     # AFC North
     'Baltimore': 'BAL', 'Cincinnati': 'CIN', 'Cleveland': 'CLE', 'Pittsburgh': 'PIT',
     # AFC South
     'Houston': 'HOU', 'Indianapolis': 'IND', 'Jacksonville': 'JAX', 'Tennessee': 'TEN',
     # AFC West
-    'Denver': 'DEN', 'KansasCity': 'KC', 'Oakland': 'LV', 'SanDiego': 'LAC',
+    'Denver': 'DEN', 'KansasCity': 'KC',
     # NFC East
-    'Dallas': 'DAL', 'NYGiants': 'NYG', 'Philadelphia': 'PHI', 'Washington': 'WAS',
+    'Dallas': 'DAL', 'NYGiants': 'NYG', 'NewYorkGiants': 'NYG',
+    'Philadelphia': 'PHI', 'Washington': 'WAS',
     # NFC North
     'Chicago': 'CHI', 'Detroit': 'DET', 'GreenBay': 'GB', 'Minnesota': 'MIN',
     # NFC South
     'Atlanta': 'ATL', 'Carolina': 'CAR', 'NewOrleans': 'NO', 'TampaBay': 'TB',
     # NFC West
-    'Arizona': 'ARI', 'LosAngeles': 'LAR', 'SanFrancisco': 'SF', 'Seattle': 'SEA',
-    # Post-move names
-    'LARams': 'LAR', 'LAChargers': 'LAC',
-    # Alternate spellings SBR uses (2016-2019 format)
-    'NewYorkJets': 'NYJ', 'NewYorkGiants': 'NYG', 'KansasCity': 'KC',
-    'GreenBay': 'GB', 'NewEngland': 'NE', 'NewOrleans': 'NO', 'TampaBay': 'TB',
-    'SanFrancisco': 'SF', 'SanDiego': 'LAC', 'LasVegas': 'LV',
-    # 2013-2015 SBR used single-word or abbreviated names
-    'Arizona': 'ARI', 'Atlanta': 'ATL', 'Baltimore': 'BAL',
-    'Buffalo': 'BUF', 'BuffaloBills': 'BUF',
-    'Carolina': 'CAR', 'Chicago': 'CHI', 'Cincinnati': 'CIN',
-    'Cleveland': 'CLE', 'Dallas': 'DAL', 'Denver': 'DEN',
-    'Detroit': 'DET', 'Houston': 'HOU', 'Indianapolis': 'IND',
-    'Jacksonville': 'JAX', 'Miami': 'MIA', 'Minnesota': 'MIN',
-    'NewOrleans': 'NO', 'NewYork': 'NYJ',  # NYJ listed as NewYork in some years
-    'NYGiants': 'NYG', 'Oakland': 'LV', 'Philadelphia': 'PHI',
-    'Pittsburgh': 'PIT', 'SanDiego': 'LAC', 'SanFrancisco': 'SF',
-    'Seattle': 'SEA', 'St.Louis': 'LAR', 'StLouis': 'LAR',
-    'TampaBay': 'TB', 'Tennessee': 'TEN', 'Washington': 'WAS',
-    'GreenBay': 'GB', 'KansasCity': 'KC',
+    'Arizona': 'ARI', 'SanFrancisco': 'SF', 'Seattle': 'SEA',
 }
+
+
+def sbr_to_nfl(sbr_name: str, season: int) -> str:
+    """
+    Convert SBR team name to nflfastR abbreviation, respecting franchise relocation eras.
+    nflfastR uses historical abbreviations: OAK (not LV), SD (not LAC), STL (not LAR).
+    """
+    # Check static teams first
+    if sbr_name in SBR_TO_NFL_BASE:
+        return SBR_TO_NFL_BASE[sbr_name]
+
+    # Era-aware relocated teams
+    # Oakland → Las Vegas (moved 2020)
+    if sbr_name in ('Oakland', 'LasVegas'):
+        return 'OAK' if season <= 2019 else 'LV'
+
+    # San Diego → LA Chargers (moved 2017)
+    if sbr_name in ('SanDiego', 'LAChargers'):
+        return 'SD' if season <= 2016 else 'LAC'
+
+    # St. Louis → LA Rams (moved 2016)
+    if sbr_name in ('St.Louis', 'StLouis'):
+        return 'STL'  # STL only appears in 2013-2015 SBR data
+    if sbr_name in ('LosAngeles', 'LARams'):
+        return 'STL' if season <= 2015 else 'LAR'
+
+    # Catch-all: 'NewYork' is ambiguous but SBR sometimes uses it for Jets
+    if sbr_name == 'NewYork':
+        return 'NYJ'
+
+    return None
 
 
 def parse_sbr_season(text, season_year):
@@ -160,8 +183,8 @@ def parse_sbr_season(text, season_year):
                 q1_combined = None
 
             if closing_total is not None:
-                away_nfl = SBR_TO_NFL.get(away_sbr)
-                home_nfl = SBR_TO_NFL.get(home_sbr)
+                away_nfl = sbr_to_nfl(away_sbr, season_year)
+                home_nfl = sbr_to_nfl(home_sbr, season_year)
                 rows.append({
                     'season':         season_year,
                     'away_team':      away_nfl,

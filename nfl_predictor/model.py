@@ -1,5 +1,27 @@
 """
-NFL Model — XGBoost training, hyperparameter tuning, save/load.
+NFL Model — Two-Stage Architecture for Over/Under Prediction.
+
+Stage 1: Rule-based filter identifies candidate games where cycle alignment
+         suggests the over is likely (dual optimal, PIC confirmed, etc.)
+Stage 2: Logistic regression scores filtered candidates using the full
+         feature set to produce calibrated probabilities.
+
+WHY NOT XGBOOST:
+  XGBoost with early stopping on AUC collapses to 3-8 trees against a
+  closing-line target because individual feature correlations are 0.02-0.08.
+  The gradient is too flat for boosting to find a stable path before early
+  stopping kills it. The dual optimal signal (57.9% accuracy, +6.4% lift)
+  is real but sparse (14% of games) — logistic regression handles sparse
+  binary signals better than tree ensembles because it doesn't need to
+  find a split threshold, it just learns a coefficient.
+
+ARCHITECTURE:
+  - Stage 1 filters to games with positive cycle alignment (bet-the-over
+    candidates) or negative alignment (bet-the-under candidates).
+  - Stage 2 logistic regression on the full training set produces
+    calibrated probabilities.
+  - Final bet decision: Stage 1 filter passes AND Stage 2 probability
+    exceeds the confidence threshold.
 """
 
 from nfl_predictor.logger import get_logger
@@ -10,8 +32,9 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 
-from xgboost import XGBClassifier
-from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     accuracy_score,
     classification_report,
@@ -30,20 +53,146 @@ MODEL_FILENAME = "nfl_scoring_predictor.pkl"
 LOCAL_MODEL_PATH = f"/tmp/{MODEL_FILENAME}"
 S3_MODEL_KEY = f"models/{MODEL_FILENAME}"
 
-# Default hyperparameters — tuned for NFL totals (~1600 rows, noisy signal)
-DEFAULT_PARAMS = {
-    "n_estimators": 1500,
-    "max_depth": 3,          # shallower — closing line target has less learnable signal
-    "learning_rate": 0.008,  # very slow — let the model build many small trees
-    "subsample": 0.8,
-    "colsample_bytree": 0.7,
-    "min_child_weight": 5,   # conservative splits — prevent overfitting on noise
-    "reg_alpha": 0.1,        # L1 regularization — encourage feature sparsity
-    "reg_lambda": 2.0,       # L2 regularization — shrink leaf weights
-    "scale_pos_weight": 1.0,
+
+# ---------------------------------------------------------------------------
+# Stage 1: Rule-based filter
+# ---------------------------------------------------------------------------
+OVER_FILTER_RULES = {
+    "dual_optimal": {
+        "col": "p2s_p2sz_dual_optimal",
+        "op": "==",
+        "val": 1.0,
+        "label": "L1xL2 dual optimal zone",
+    },
 }
 
-# Hyperparameter search space
+OVER_BOOST_SIGNALS = {
+    "pic_confirmed": {
+        "col": "pic_cycle_confirmed",
+        "op": "==",
+        "val": 1.0,
+        "weight": 0.10,
+        "label": "PIC all-layer alignment",
+    },
+    "matchup_dual": {
+        "col": "matchup_dual_optimal",
+        "op": "==",
+        "val": 1.0,
+        "weight": 0.05,
+        "label": "Matchup dual optimal (opp def suppressed)",
+    },
+    "not_windy": {
+        "col": "wind_mph",
+        "op": "<=",
+        "val": 15.0,
+        "weight": 0.03,
+        "label": "Not windy (favorable scoring conditions)",
+    },
+    "dome": {
+        "col": "is_dome",
+        "op": "==",
+        "val": 1.0,
+        "weight": 0.03,
+        "label": "Dome game (controlled environment)",
+    },
+}
+
+UNDER_FILTER_RULES = {
+    "cold_streak": {
+        "col": "p2s_cold_streak_prob",
+        "op": ">=",
+        "val": 0.6,
+        "label": "Cold streak probability high",
+    },
+    "low_conversion": {
+        "col": "p2s_conversion_rate_5g",
+        "op": "<=",
+        "val": 0.25,
+        "label": "Low recent scoring drive rate",
+    },
+}
+
+
+def apply_filter(df: pd.DataFrame, rules: dict) -> pd.Series:
+    """Apply rule-based filter, returning a boolean mask. All rules must pass (AND logic)."""
+    mask = pd.Series(True, index=df.index)
+    for rule_name, rule in rules.items():
+        col = rule["col"]
+        if col not in df.columns:
+            continue
+        op = rule["op"]
+        val = rule["val"]
+        if op == "==":
+            mask &= (df[col] == val)
+        elif op == ">=":
+            mask &= (df[col] >= val)
+        elif op == "<=":
+            mask &= (df[col] <= val)
+        elif op == ">":
+            mask &= (df[col] > val)
+        elif op == "<":
+            mask &= (df[col] < val)
+    return mask
+
+
+def compute_boost_score(df: pd.DataFrame, signals: dict) -> pd.Series:
+    """Compute additive boost from strengthening signals."""
+    boost = pd.Series(0.0, index=df.index)
+    for sig_name, sig in signals.items():
+        col = sig["col"]
+        if col not in df.columns:
+            continue
+        op = sig["op"]
+        val = sig["val"]
+        weight = sig["weight"]
+        if op == "==":
+            boost += (df[col] == val).astype(float) * weight
+        elif op == ">=":
+            boost += (df[col] >= val).astype(float) * weight
+        elif op == "<=":
+            boost += (df[col] <= val).astype(float) * weight
+    return boost
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: Logistic Regression — feature subset
+# ---------------------------------------------------------------------------
+LOGISTIC_FEATURES = [
+    # Weather / venue
+    "wind_mph", "temp", "is_dome", "is_cold_game", "is_windy_game",
+    # Market signals
+    "opening_total", "total_movement", "opening_spread", "spread_movement",
+    # Cycle state (L1)
+    "p2s_ratio", "p2s_optimal_zone", "p2s_conversion_rate_5g",
+    "p2s_cold_streak_prob", "p2s_hot_streak_prob",
+    # Cycle state (L2)
+    "p2sz_rz_ratio", "p2sz_rz_optimal_zone", "p2sz_sp_baseline", "p2sz_rz_rate_5g",
+    # Intersection
+    "p2s_p2sz_dual_optimal", "p2s_p2sz_signal_strength", "matchup_dual_optimal",
+    # Defense
+    "p2s_def_ratio", "p2s_def_optimal_zone",
+    # EPA
+    "epa_offense_avg", "epa_defense_avg",
+    # PIC (Layer 3)
+    "pic_qb_in_zone", "pic_qb_career_rate", "pic_team_alignment",
+    "pic_skill_sync_rate", "pic_avg_player_epa", "pic_present_quality",
+    "pic_cycle_confirmed", "pic_qb_is_backup",
+    # Scoring trends
+    "scoring_avg_5g", "scoring_allowed_avg_5g",
+    # Context
+    "is_home", "rest_advantage", "is_div_game",
+]
+
+
+# ---------------------------------------------------------------------------
+# Legacy constants (kept for backward compat with tune endpoint)
+# ---------------------------------------------------------------------------
+DEFAULT_PARAMS = {
+    "n_estimators": 1500, "max_depth": 3, "learning_rate": 0.008,
+    "subsample": 0.8, "colsample_bytree": 0.7, "min_child_weight": 5,
+    "reg_alpha": 0.1, "reg_lambda": 2.0, "scale_pos_weight": 1.0,
+}
+
 PARAM_GRID = {
     "n_estimators": [300, 500, 700, 1000],
     "max_depth": [3, 4, 5, 6],
@@ -66,55 +215,34 @@ def train_model(
     params: dict = None,
 ) -> tuple:
     """
-    Train XGBoost classifier on featured data.
-
-    Args:
-        featured_data: DataFrame with feature columns and target
-        test_size: Fraction held out for validation
-        random_state: Random seed
-        params: Optional hyperparameters (uses DEFAULT_PARAMS if None)
-
-    Returns:
-        (model, metrics_dict) or (None, error_dict)
+    Train two-stage model: rule filter + logistic regression.
+    Returns (model_package, metrics_dict).
     """
     logger.info("[MODEL] ============================================================")
-    logger.info(f"[MODEL] TRAINING XGBoost -- target={TARGET_COLUMN}, rows={len(featured_data)}")
+    logger.info(f"[MODEL] TRAINING Two-Stage Model -- target={TARGET_COLUMN}, rows={len(featured_data)}")
     logger.info("[MODEL] ============================================================")
 
-    hp = params or DEFAULT_PARAMS
+    available_features = [f for f in LOGISTIC_FEATURES if f in featured_data.columns]
+    all_features = [f for f in FEATURE_COLUMNS if f in featured_data.columns]
+    missing = [f for f in LOGISTIC_FEATURES if f not in featured_data.columns]
+    if missing:
+        logger.warning(f"[MODEL] Missing logistic features (will skip): {missing}")
 
-    # Select available features
-    available_features = [f for f in FEATURE_COLUMNS if f in featured_data.columns]
-    missing_features = [f for f in FEATURE_COLUMNS if f not in featured_data.columns]
-
-    if missing_features:
-        logger.warning(f"[MODEL] Missing features (will skip): {missing_features}")
-
-    logger.info(f"[MODEL] Using {len(available_features)} features")
-    logger.info(f"[MODEL] Hyperparameters: {hp}")
+    logger.info(f"[MODEL] Logistic features: {len(available_features)}/{len(LOGISTIC_FEATURES)}")
+    logger.info(f"[MODEL] Architecture: Stage 1 (rule filter) + Stage 2 (logistic regression)")
 
     X = featured_data[available_features].copy()
     y = featured_data[TARGET_COLUMN].copy()
 
-    # Closing lines entry diagnostic — confirm closing_total value at model boundary
-    if "closing_total" in X.columns:
-        ct_valid = X["closing_total"].notna().sum()
-        ct_sample = X["closing_total"].dropna().head(3).tolist()
-        logger.info(f"[MODEL] closing_total in X: {ct_valid}/{len(X)} valid, sample={ct_sample}")
-    else:
-        logger.error("[MODEL] closing_total NOT in X — dropped during feature selection")
-
-    # Pre-training NaN audit
+    # NaN audit
     nan_counts = X.isnull().sum()
     cols_with_nans = nan_counts[nan_counts > 0]
     if len(cols_with_nans) > 0:
         logger.info(f"[MODEL] NaN audit -- {len(cols_with_nans)} cols with NaN:")
         for col, count in cols_with_nans.items():
             logger.info(f"[MODEL]   {col}: {count} ({count/len(X)*100:.1f}%)")
-    else:
-        logger.info("[MODEL] NaN audit: all features clean")
 
-    # Feature correlation with target
+    # Feature correlations
     logger.info("[MODEL] Feature-target correlations (top 15):")
     correlations = {}
     import warnings
@@ -133,94 +261,76 @@ def train_model(
     logger.info(f"[MODEL] Target distribution: {y.value_counts().to_dict()}")
     logger.info(f"[MODEL] Target positive rate: {y.mean():.3f}")
 
-    # Three-way split: train / calibration / test
-    X_temp, X_test, y_temp, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=random_state, stratify=y,
+    # Train/test split
+    X_full = featured_data[all_features].copy()
+    X_train_full, X_test_full, y_train, y_test = train_test_split(
+        X_full, y, test_size=test_size, random_state=random_state, stratify=y,
     )
-    X_train, X_cal, y_train, y_cal = train_test_split(
-        X_temp, y_temp, test_size=0.25, random_state=random_state, stratify=y_temp,
-    )
-    logger.info(f"[MODEL] Split: train={len(X_train)}, cal={len(X_cal)}, test={len(X_test)}")
+    X_train = X_train_full[available_features].copy()
+    X_test = X_test_full[available_features].copy()
+    logger.info(f"[MODEL] Split: train={len(X_train)}, test={len(X_test)}")
 
-    # Train XGBoost
+    # ── Stage 1: Filter evaluation ──
+    logger.info("[MODEL] -- Stage 1: Rule Filter Evaluation --")
+
+    over_mask_train = apply_filter(X_train_full, OVER_FILTER_RULES)
+    over_mask_test = apply_filter(X_test_full, OVER_FILTER_RULES)
+
+    n_over_train = over_mask_train.sum()
+    n_over_test = over_mask_test.sum()
+    logger.info(f"[MODEL]   Over filter (train): {n_over_train}/{len(X_train)} ({n_over_train/len(X_train)*100:.1f}%)")
+    logger.info(f"[MODEL]   Over filter (test):  {n_over_test}/{len(X_test)} ({n_over_test/len(X_test)*100:.1f}%)")
+
+    filter_acc = None
+    if n_over_test > 5:
+        filter_acc = float((y_test[over_mask_test] == 1).mean())
+        base_rate = float(y_test.mean())
+        lift = filter_acc - base_rate
+        logger.info(f"[MODEL]   Filter accuracy (test): {filter_acc:.4f} (n={n_over_test})")
+        logger.info(f"[MODEL]   Base rate:              {base_rate:.4f}")
+        logger.info(f"[MODEL]   Filter lift:            {lift:+.4f} ({lift/base_rate*100:+.1f}%)")
+
+    # Boost diagnostic
+    boost_test = compute_boost_score(X_test_full, OVER_BOOST_SIGNALS)
+    if n_over_test > 5:
+        boosted_mask = over_mask_test & (boost_test > 0.05)
+        if boosted_mask.sum() > 5:
+            boosted_acc = float((y_test[boosted_mask] == 1).mean())
+            logger.info(f"[MODEL]   Filter + boost (test):  {boosted_acc:.4f} (n={boosted_mask.sum()})")
+
+    # ── Stage 2: Logistic Regression ──
+    logger.info("[MODEL] -- Stage 2: Logistic Regression --")
+
     import time as _time
     train_start = _time.time()
-    logger.info("[MODEL] Training XGBoost...")
 
-    xgb_model = XGBClassifier(
-        n_estimators=hp.get("n_estimators", 500),
-        max_depth=hp.get("max_depth", 4),
-        learning_rate=hp.get("learning_rate", 0.02),
-        subsample=hp.get("subsample", 0.8),
-        colsample_bytree=hp.get("colsample_bytree", 0.7),
-        min_child_weight=hp.get("min_child_weight", 3),
-        reg_alpha=hp.get("reg_alpha", 0.05),
-        reg_lambda=hp.get("reg_lambda", 1.0),
-        scale_pos_weight=hp.get("scale_pos_weight", 1.0),
-        random_state=random_state,
-        eval_metric="auc",        # AUC more meaningful than logloss for this signal
-        early_stopping_rounds=100, # generous patience at lr=0.008 — let it find subtle signal
-        n_jobs=-1,
-    )
+    # Compute train medians BEFORE imputation for reproducibility
+    train_medians = X_train.median()
 
-    xgb_model.fit(
-        X_train, y_train,
-        eval_set=[(X_cal, y_cal)],
-        verbose=False,
+    X_train_imputed = X_train.fillna(train_medians)
+    X_test_imputed = X_test.fillna(train_medians)
+
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train_imputed)
+    X_test_scaled = scaler.transform(X_test_imputed)
+
+    lr_model = LogisticRegression(
+        C=0.1, penalty="l2", solver="lbfgs", max_iter=1000, random_state=random_state,
     )
+    lr_model.fit(X_train_scaled, y_train)
 
     train_elapsed = _time.time() - train_start
-    best_iteration = getattr(xgb_model, "best_iteration", None)
-    best_score = getattr(xgb_model, "best_score", None)
-    logger.info(f"[MODEL] Training done in {train_elapsed:.2f}s, best_iteration={best_iteration}")
-    if best_score:
-        logger.info(f"[MODEL] Best eval AUC: {best_score:.6f}")
+    logger.info(f"[MODEL] Logistic regression trained in {train_elapsed:.2f}s")
 
-    # Probability calibration on held-out cal set.
-    # GUARD: skip calibration if XGBoost barely trained (best_iteration <= 10).
-    # With 1-2 trees, raw scores are nearly constant — calibration fits a flat
-    # function and collapses all predictions to the mean (~0.46).
-    from sklearn.isotonic import IsotonicRegression
-    calibrator = None
-    use_calibration = best_iteration is not None and best_iteration > 10
-    if use_calibration:
-        raw_cal = xgb_model.predict_proba(X_cal)[:, 1]
-        raw_std = raw_cal.std()
-        logger.info(f"[MODEL] Calibrating (isotonic regression, best_iteration={best_iteration} > 10)...")
-        logger.info(f"[MODEL]   Raw cal proba — mean={raw_cal.mean():.3f}, min={raw_cal.min():.3f}, max={raw_cal.max():.3f}, std={raw_std:.3f}")
+    # Coefficients
+    coef_dict = dict(zip(available_features, lr_model.coef_[0]))
+    sorted_coefs = sorted(coef_dict.items(), key=lambda x: abs(x[1]), reverse=True)
+    logger.info("[MODEL] Top 20 logistic coefficients (magnitude):")
+    for rank, (feat, coef) in enumerate(sorted_coefs[:20], 1):
+        logger.info(f"[MODEL]   # {rank} {feat}: {coef:+.4f}")
 
-        # Guard: isotonic degrades to a step function when raw spread is too narrow.
-        # With std < 0.08, the calibrator maps all mid-range scores to one plateau
-        # and makes confidence tiers meaningless. Raw probabilities are more useful.
-        MIN_RAW_STD = 0.06  # lowered from 0.08 — allows calibration at current data volume
-        if raw_std < MIN_RAW_STD:
-            logger.warning(f"[MODEL] Skipping calibration — raw std={raw_std:.3f} < {MIN_RAW_STD} "
-                          f"(distribution too narrow; isotonic would produce step function). "
-                          f"Using raw XGBoost probabilities.")
-            use_calibration = False
-        else:
-            calibrator = IsotonicRegression(out_of_bounds="clip")
-            calibrator.fit(raw_cal, y_cal)
-            cal_out = calibrator.predict(raw_cal)
-            logger.info(f"[MODEL]   Post-calibration — mean={cal_out.mean():.3f}, "
-                       f"min={cal_out.min():.3f}, max={cal_out.max():.3f}, "
-                       f"above_0.5={(cal_out >= 0.5).sum()}/{len(cal_out)}")
-            logger.info("[MODEL] Calibration applied")
-    else:
-        logger.warning(f"[MODEL] Skipping calibration — best_iteration={best_iteration} <= 10 "
-                       "(too few trees; raw probabilities more reliable than calibrated flat scores)")
-
-    # Evaluate on test set
-    raw_test = xgb_model.predict_proba(X_test)[:, 1]
-    if calibrator is not None:
-        y_proba = calibrator.predict(raw_test)
-        logger.info(f"[MODEL]   Raw test proba — mean={raw_test.mean():.3f}, "
-                   f"min={raw_test.min():.3f}, max={raw_test.max():.3f}")
-        logger.info(f"[MODEL]   Calibrated test — mean={y_proba.mean():.3f}, "
-                   f"min={y_proba.min():.3f}, max={y_proba.max():.3f}, "
-                   f"above_0.5={(y_proba >= 0.5).sum()}/{len(y_proba)}")
-    else:
-        y_proba = raw_test
+    # ── Evaluate ──
+    y_proba = lr_model.predict_proba(X_test_scaled)[:, 1]
     y_pred = (y_proba >= 0.5).astype(int)
 
     accuracy = accuracy_score(y_test, y_pred)
@@ -228,7 +338,7 @@ def train_model(
     logloss = log_loss(y_test, y_proba)
     brier = float(np.mean((y_proba - y_test.values) ** 2))
 
-    logger.info("[MODEL] ---- Test Set Results ----")
+    logger.info("[MODEL] ---- Test Set Results (all games) ----")
     logger.info(f"[MODEL]   Accuracy:    {accuracy:.4f}  (break-even: 0.5238)")
     logger.info(f"[MODEL]   AUC-ROC:     {auc:.4f}")
     logger.info(f"[MODEL]   Log Loss:    {logloss:.4f}")
@@ -239,75 +349,88 @@ def train_model(
         if line.strip():
             logger.info(f"[MODEL]   {line}")
 
-    # Probability spread diagnostic — critical for catching calibration collapse.
-    # If isotonic is working correctly, you should see a spread across 0.3-0.7.
-    # If everything is still < 0.5, calibration is still compressing signal.
+    # Probability spread
     logger.info("[MODEL] Probability spread diagnostic (test set):")
-    logger.info(f"[MODEL]   Raw XGBoost    — mean={raw_test.mean():.3f}, "
-               f"std={raw_test.std():.3f}, "
-               f"min={raw_test.min():.3f}, max={raw_test.max():.3f}, "
-               f"above_0.5={(raw_test >= 0.5).sum()}/{len(raw_test)}")
-    logger.info(f"[MODEL]   Final (calibrated) — mean={y_proba.mean():.3f}, "
-               f"std={y_proba.std():.3f}, "
-               f"min={y_proba.min():.3f}, max={y_proba.max():.3f}, "
+    logger.info(f"[MODEL]   Logistic — mean={y_proba.mean():.3f}, "
+               f"std={y_proba.std():.3f}, min={y_proba.min():.3f}, max={y_proba.max():.3f}, "
                f"above_0.5={(y_proba >= 0.5).sum()}/{len(y_proba)}")
-    # Percentile breakdown — shows the full distribution shape
     percentiles = [10, 25, 50, 75, 90]
     pct_vals = np.percentile(y_proba, percentiles)
     pct_str = ", ".join(f"p{p}={v:.3f}" for p, v in zip(percentiles, pct_vals))
     logger.info(f"[MODEL]   Percentiles: {pct_str}")
 
-    # Feature importance
-    importance = dict(zip(available_features, xgb_model.feature_importances_))
-    sorted_importance = sorted(importance.items(), key=lambda x: x[1], reverse=True)
-    logger.info("[MODEL] Feature Importance (top 20):")
-    for rank, (feat, imp) in enumerate(sorted_importance[:20], 1):
-        logger.info(f"[MODEL]   # {rank} {feat}: {imp:.4f}")
+    # ── Two-stage combined evaluation ──
+    logger.info("[MODEL] -- Two-Stage Combined Results --")
 
-    # Confidence tier accuracy
-    confidences = np.maximum(y_proba, 1 - y_proba)
-    correct = (y_pred == y_test.values).astype(int)
-    logger.info("[MODEL] Confidence tier accuracy (test set):")
-    for tier_label, tier_thresh in [("P>=55%", 0.55), ("P>=57%", 0.57), ("P>=60%", 0.60), ("P>=65%", 0.65)]:
-        mask = confidences >= tier_thresh
-        if mask.sum() >= 10:
-            tier_acc = correct[mask].mean()
-            be = "BEAT break-even" if tier_acc >= 0.5238 else "below break-even"
-            logger.info(f"[MODEL]   {tier_label}: {correct[mask].sum()}/{mask.sum()} ({tier_acc*100:.1f}%) -- {be}")
+    over_bettable = over_mask_test & (y_proba >= 0.50)
+    if over_bettable.sum() > 5:
+        over_acc = float((y_test[over_bettable] == 1).mean())
+        logger.info(f"[MODEL]   OVER bets (filter + P>=0.50): {over_acc:.4f} "
+                   f"(n={over_bettable.sum()}, lift={over_acc - float(y_test.mean()):+.4f})")
+
+    logger.info("[MODEL]   Confidence tiers (filtered over candidates):")
+    for thresh_label, thresh in [("P>=0.50", 0.50), ("P>=0.52", 0.52),
+                                  ("P>=0.55", 0.55), ("P>=0.57", 0.57), ("P>=0.60", 0.60)]:
+        tier_mask = over_mask_test & (y_proba >= thresh)
+        n_tier = tier_mask.sum()
+        if n_tier >= 5:
+            tier_acc = float((y_test[tier_mask] == 1).mean())
+            logger.info(f"[MODEL]     {thresh_label}: {tier_acc:.4f} win rate "
+                       f"(n={n_tier}, ROI={_roi_from_winrate(tier_acc):+.1f}%)")
         else:
-            logger.info(f"[MODEL]   {tier_label}: <10 samples")
+            logger.info(f"[MODEL]     {thresh_label}: <5 samples")
 
-    # Prediction probability distribution
-    logger.info("[MODEL] Prediction probability distribution (test set):")
-    for threshold in [0.45, 0.5, 0.52, 0.55, 0.6, 0.65, 0.7]:
-        count = (y_proba >= threshold).sum()
-        logger.info(f"[MODEL]   P >= {threshold}: {count}/{len(y_proba)} ({count/len(y_proba)*100:.1f}%)")
+    under_mask_test = apply_filter(X_test_full, UNDER_FILTER_RULES)
+    under_bettable = under_mask_test & (y_proba < 0.50)
+    if under_bettable.sum() > 5:
+        under_acc = float((y_test[under_bettable] == 0).mean())
+        logger.info(f"[MODEL]   UNDER bets (filter + P<0.50): {under_acc:.4f} "
+                   f"(n={under_bettable.sum()}, lift={under_acc - (1 - float(y_test.mean())):+.4f})")
 
-    # L1/L2 intersection diagnostic
-    if "p2s_p2sz_dual_optimal" in X_test.columns:
-        dual_mask = X_test["p2s_p2sz_dual_optimal"] == 1.0
+    all_bettable = over_bettable | under_bettable
+    if all_bettable.sum() > 5:
+        over_correct = int((y_test[over_bettable] == 1).sum()) if over_bettable.sum() > 0 else 0
+        under_correct = int((y_test[under_bettable] == 0).sum()) if under_bettable.sum() > 0 else 0
+        total_bets = int(all_bettable.sum())
+        total_correct = over_correct + under_correct
+        combined_acc = total_correct / total_bets
+        logger.info(f"[MODEL]   ALL bets combined: {combined_acc:.4f} win rate "
+                   f"(n={total_bets}, ROI={_roi_from_winrate(combined_acc):+.1f}%)")
+
+    # Intersection diagnostic (comparability with XGBoost runs)
+    if "p2s_p2sz_dual_optimal" in X_test_full.columns:
+        dual_mask = X_test_full["p2s_p2sz_dual_optimal"] == 1.0
         if dual_mask.sum() > 5:
-            acc_dual = correct[dual_mask.values].mean()
-            acc_non = correct[~dual_mask.values].mean()
-            logger.info(f"[MODEL] Intersection diagnostic (L1×L2 dual optimal):")
-            logger.info(f"[MODEL]   Dual optimal: {acc_dual:.4f} (n={dual_mask.sum()})")
-            logger.info(f"[MODEL]   Non-dual: {acc_non:.4f} | Lift: {acc_dual - acc_non:+.4f}")
+            acc_dual_raw = float((y_test[dual_mask] == 1).mean())
+            acc_non = float((y_test[~dual_mask] == 1).mean())
+            logger.info(f"[MODEL] Intersection diagnostic (L1xL2 dual optimal):")
+            logger.info(f"[MODEL]   Dual optimal (raw): {acc_dual_raw:.4f} (n={dual_mask.sum()})")
+            logger.info(f"[MODEL]   Non-dual: {acc_non:.4f} | Lift: {acc_dual_raw - acc_non:+.4f}")
 
-            # PIC-complete diagnostic: dual optimal accuracy only where PIC data present
-            # This isolates the signal quality from the 2013-2015 PIC coverage gap
-            if "pic_ol_sync_rate" in X_test.columns:
-                pic_complete = X_test["pic_ol_sync_rate"].notna()
+            if "pic_ol_sync_rate" in X_test_full.columns:
+                pic_complete = X_test_full["pic_ol_sync_rate"].notna()
                 dual_pic = dual_mask & pic_complete
                 non_dual_pic = ~dual_mask & pic_complete
                 if dual_pic.sum() > 10 and non_dual_pic.sum() > 10:
-                    acc_dual_pic = correct[dual_pic.values].mean()
-                    acc_non_pic = correct[non_dual_pic.values].mean()
-                    logger.info(f"[MODEL]   Dual optimal (PIC-complete only, n={dual_pic.sum()}):")
-                    logger.info(f"[MODEL]     Accuracy: {acc_dual_pic:.4f} | Lift vs non-dual: {acc_dual_pic - acc_non_pic:+.4f}")
-                    logger.info(f"[MODEL]     Non-dual (PIC-complete): {acc_non_pic:.4f} (n={non_dual_pic.sum()})")
+                    acc_dual_pic = float((y_test[dual_pic] == 1).mean())
+                    acc_non_pic = float((y_test[non_dual_pic] == 1).mean())
+                    logger.info(f"[MODEL]   Dual optimal (PIC-complete, n={dual_pic.sum()}):")
+                    logger.info(f"[MODEL]     Accuracy: {acc_dual_pic:.4f} | Lift: {acc_dual_pic - acc_non_pic:+.4f}")
 
-    # Save model + calibrator
-    _save_model(xgb_model, calibrator, available_features)
+    # ── Save ──
+    model_package = {
+        "type": "two_stage_v1",
+        "scaler": scaler,
+        "logistic_model": lr_model,
+        "logistic_features": available_features,
+        "all_features": all_features,
+        "train_medians": train_medians.to_dict(),
+        "over_filter_rules": OVER_FILTER_RULES,
+        "over_boost_signals": OVER_BOOST_SIGNALS,
+        "under_filter_rules": UNDER_FILTER_RULES,
+        "saved_at": datetime.utcnow().isoformat(),
+    }
+    _save_model_package(model_package)
 
     metrics = {
         "accuracy": round(accuracy, 4),
@@ -317,10 +440,10 @@ def train_model(
         "train_rows": len(X_train),
         "test_rows": len(X_test),
         "features_used": len(available_features),
-        "best_iteration": best_iteration,
-        "feature_importance": {k: round(v, 4) for k, v in sorted_importance},
+        "filter_pass_rate": round(float(n_over_test) / len(X_test), 4) if len(X_test) > 0 else 0,
+        "filter_accuracy": round(filter_acc, 4) if filter_acc is not None else None,
+        "coefficients": {k: round(v, 4) for k, v in sorted_coefs[:20]},
         "positive_rate": round(float(y.mean()), 4),
-        "hyperparameters": hp,
         "timestamp": datetime.utcnow().isoformat(),
     }
 
@@ -328,11 +451,53 @@ def train_model(
     logger.info(f"[MODEL] COMPLETE -- Acc={accuracy:.4f}, AUC={auc:.4f}, Brier={brier:.4f}")
     logger.info("[MODEL] ============================================================")
 
-    return xgb_model, metrics
+    return model_package, metrics
+
+
+def _roi_from_winrate(win_rate: float) -> float:
+    """Convert win rate to ROI assuming -110 odds."""
+    if win_rate <= 0:
+        return -100.0
+    return (win_rate * (100 / 110) - (1 - win_rate)) * 100
 
 
 # ---------------------------------------------------------------------------
-# Hyperparameter Tuning
+# Prediction (production)
+# ---------------------------------------------------------------------------
+def predict(model_package: dict, game_features: pd.DataFrame) -> pd.DataFrame:
+    """Score games using the two-stage model."""
+    lr_model = model_package["logistic_model"]
+    scaler = model_package["scaler"]
+    features = model_package["logistic_features"]
+    medians = model_package.get("train_medians", {})
+
+    X = game_features[features].copy()
+    for col in features:
+        if col in medians:
+            X[col] = X[col].fillna(medians[col])
+    X_scaled = scaler.transform(X)
+    proba = lr_model.predict_proba(X_scaled)[:, 1]
+
+    over_mask = apply_filter(game_features, model_package.get("over_filter_rules", OVER_FILTER_RULES))
+    under_mask = apply_filter(game_features, model_package.get("under_filter_rules", UNDER_FILTER_RULES))
+    boost = compute_boost_score(game_features, model_package.get("over_boost_signals", OVER_BOOST_SIGNALS))
+
+    result = pd.DataFrame({
+        "over_probability": proba,
+        "over_filter": over_mask,
+        "under_filter": under_mask,
+        "boost_score": boost,
+    }, index=game_features.index)
+
+    result["bet_recommendation"] = "no_bet"
+    result.loc[over_mask & (proba >= 0.50), "bet_recommendation"] = "over"
+    result.loc[under_mask & (proba < 0.50), "bet_recommendation"] = "under"
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tune (logistic C parameter)
 # ---------------------------------------------------------------------------
 def tune_hyperparameters(
     featured_data: pd.DataFrame,
@@ -340,93 +505,52 @@ def tune_hyperparameters(
     cv_folds: int = 5,
     random_state: int = 42,
 ) -> dict:
-    """Random search over hyperparameter space with cross-validation."""
-    import random as rng
+    """Tune logistic regression C parameter via cross-validation."""
+    from sklearn.model_selection import StratifiedKFold, cross_val_score
 
     logger.info("[TUNE] ============================================================")
-    logger.info(f"[TUNE] Hyperparameter tuning: {n_iter} iterations, {cv_folds}-fold CV")
+    logger.info(f"[TUNE] Logistic C tuning: {n_iter} values, {cv_folds}-fold CV")
     logger.info("[TUNE] ============================================================")
 
-    available_features = [f for f in FEATURE_COLUMNS if f in featured_data.columns]
-    X = featured_data[available_features].copy()
+    available_features = [f for f in LOGISTIC_FEATURES if f in featured_data.columns]
+    X = featured_data[available_features].fillna(featured_data[available_features].median())
     y = featured_data[TARGET_COLUMN].copy()
 
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
     cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
-    rng.seed(random_state)
 
-    logger.info("[TUNE] Scoring baseline (default params)...")
-    baseline_model = XGBClassifier(**{k: v for k, v in DEFAULT_PARAMS.items() if k != "scale_pos_weight"},
-                                   random_state=random_state, eval_metric="auc")
-    baseline_scores = cross_val_score(baseline_model, X, y, cv=cv, scoring="roc_auc")
-    baseline_mean = baseline_scores.mean()
-    baseline_std = baseline_scores.std()
-    logger.info(f"[TUNE] Baseline AUC: {baseline_mean:.4f} ± {baseline_std:.4f}")
-
-    all_results = []
+    c_values = np.logspace(-3, 2, n_iter)
     best_score = 0
-    best_params = None
+    best_c = None
+    results = []
 
-    for i in range(n_iter):
-        params = {key: rng.choice(values) for key, values in PARAM_GRID.items()}
-        try:
-            model = XGBClassifier(**params, random_state=random_state, eval_metric="auc")
-            scores = cross_val_score(model, X, y, cv=cv, scoring="roc_auc")
-            mean_score = scores.mean()
-            std_score = scores.std()
-            result = {
-                "iteration": i + 1,
-                "params": params,
-                "mean_auc": round(mean_score, 4),
-                "std_auc": round(std_score, 4),
-            }
-            all_results.append(result)
-            if mean_score > best_score:
-                best_score = mean_score
-                best_params = params.copy()
-                logger.info(f"[TUNE] Iter {i+1}/{n_iter}: NEW BEST AUC {mean_score:.4f} ± {std_score:.4f}")
-            elif (i + 1) % 10 == 0:
-                logger.info(f"[TUNE] Iter {i+1}/{n_iter}: {mean_score:.4f} | Best: {best_score:.4f}")
-        except Exception as e:
-            logger.warning(f"[TUNE] Iter {i+1} failed: {e}")
-
-    all_results.sort(key=lambda x: x["mean_auc"], reverse=True)
-    improvement = best_score - baseline_mean
+    for c_val in c_values:
+        lr = LogisticRegression(C=c_val, penalty="l2", solver="lbfgs",
+                                max_iter=1000, random_state=random_state)
+        scores = cross_val_score(lr, X_scaled, y, cv=cv, scoring="roc_auc")
+        mean_score = scores.mean()
+        results.append({"C": round(float(c_val), 6), "mean_auc": round(float(mean_score), 4)})
+        if mean_score > best_score:
+            best_score = mean_score
+            best_c = c_val
+            logger.info(f"[TUNE] C={c_val:.4f}: NEW BEST AUC {mean_score:.4f}")
 
     logger.info("[TUNE] ============================================================")
-    logger.info(f"[TUNE] Baseline AUC: {baseline_mean:.4f} ± {baseline_std:.4f}")
-    logger.info(f"[TUNE] Best AUC:     {best_score:.4f}")
-    logger.info(f"[TUNE] Improvement:  {improvement:+.4f}")
-    logger.info(f"[TUNE] Best params:  {best_params}")
+    logger.info(f"[TUNE] Best C: {best_c:.6f}, AUC: {best_score:.4f}")
     logger.info("[TUNE] ============================================================")
 
     return {
-        "baseline": {
-            "params": DEFAULT_PARAMS,
-            "mean_auc": round(baseline_mean, 4),
-            "std_auc": round(baseline_std, 4),
-        },
-        "best": {
-            "params": best_params,
-            "mean_auc": round(best_score, 4),
-            "improvement": round(improvement, 4),
-        },
-        "top_10": all_results[:10],
-        "total_iterations": len(all_results),
+        "best": {"C": float(best_c), "mean_auc": round(float(best_score), 4)},
+        "all_results": sorted(results, key=lambda x: x["mean_auc"], reverse=True)[:10],
     }
 
 
 # ---------------------------------------------------------------------------
 # Save / Load
 # ---------------------------------------------------------------------------
-def _save_model(model, calibrator, feature_columns: list):
-    """Save model + isotonic calibrator + feature list to local disk and S3."""
-    model_package = {
-        "model": model,
-        "calibrator": calibrator,
-        "features": feature_columns,
-        "saved_at": datetime.utcnow().isoformat(),
-    }
-
+def _save_model_package(model_package: dict):
+    """Save two-stage model package to local disk and S3."""
     with open(LOCAL_MODEL_PATH, "wb") as f:
         pickle.dump(model_package, f)
     logger.info(f"[MODEL] Saved locally: {LOCAL_MODEL_PATH}")
@@ -440,25 +564,40 @@ def _save_model(model, calibrator, feature_columns: list):
         logger.warning(f"[MODEL] S3 save failed (non-fatal): {e}")
 
 
+def _save_model(model, calibrator, feature_columns: list):
+    """Legacy compatibility wrapper."""
+    _save_model_package({
+        "type": "legacy_xgboost",
+        "model": model,
+        "calibrator": calibrator,
+        "features": feature_columns,
+        "saved_at": datetime.utcnow().isoformat(),
+    })
+
+
 def load_model() -> tuple:
-    """Load model + calibrator from local disk or S3."""
+    """
+    Load model. Returns (model_package, features, None) for two-stage,
+    or (xgb_model, features, calibrator) for legacy.
+    """
+    def _load_from_path(path):
+        with open(path, "rb") as f:
+            package = pickle.load(f)
+        if isinstance(package, dict) and package.get("type", "").startswith("two_stage"):
+            return package, package.get("logistic_features") or package.get("all_features"), None
+        calibrator = package.get("calibrator") or package.get("platt")
+        return package.get("model") or package, package.get("features"), calibrator
+
     if os.path.exists(LOCAL_MODEL_PATH):
         logger.info(f"[MODEL] Loading from local: {LOCAL_MODEL_PATH}")
-        with open(LOCAL_MODEL_PATH, "rb") as f:
-            package = pickle.load(f)
-        # Support both old 'platt' key and new 'calibrator' key
-        calibrator = package.get("calibrator") or package.get("platt")
-        return package["model"], package.get("features"), calibrator
+        return _load_from_path(LOCAL_MODEL_PATH)
 
     try:
         bucket = os.environ.get("S3_BUCKET", "nfl-predictor-bucket")
         s3 = boto3.client("s3")
         s3.download_file(bucket, S3_MODEL_KEY, LOCAL_MODEL_PATH)
         logger.info(f"[MODEL] Downloaded from S3: s3://{bucket}/{S3_MODEL_KEY}")
-        with open(LOCAL_MODEL_PATH, "rb") as f:
-            package = pickle.load(f)
-        calibrator = package.get("calibrator") or package.get("platt")
-        return package["model"], package.get("features"), calibrator
+        return _load_from_path(LOCAL_MODEL_PATH)
     except Exception as e:
         logger.warning(f"[MODEL] No model found: {e}")
         return None, None, None
