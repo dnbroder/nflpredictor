@@ -518,7 +518,26 @@ def tune_hyperparameters(
     available_features = [f for f in LOGISTIC_FEATURES if f in featured_data.columns]
     logger.info(f"[TUNE] Features: {len(available_features)}/{len(LOGISTIC_FEATURES)}")
     
-    X = featured_data[available_features].fillna(featured_data[available_features].median())
+    X = featured_data[available_features].copy()
+    medians = X.median()
+    X = X.fillna(medians)
+    
+    # Drop columns that are still all-NaN after imputation (happens when
+    # closing lines or other data sources are completely missing)
+    still_nan = X.columns[X.isnull().all()].tolist()
+    if still_nan:
+        logger.warning(f"[TUNE] Dropping {len(still_nan)} all-NaN columns after imputation: {still_nan}")
+        X = X.drop(columns=still_nan)
+        available_features = [f for f in available_features if f not in still_nan]
+    
+    # Also drop columns where median imputation produced NaN (all values were NaN)
+    remaining_nan_cols = X.columns[X.isnull().any()].tolist()
+    if remaining_nan_cols:
+        logger.warning(f"[TUNE] Dropping {len(remaining_nan_cols)} cols with residual NaN: {remaining_nan_cols}")
+        X = X.drop(columns=remaining_nan_cols)
+        available_features = [f for f in available_features if f not in remaining_nan_cols]
+    
+    logger.info(f"[TUNE] Features after NaN cleanup: {len(available_features)}")
     y = featured_data[TARGET_COLUMN].copy()
 
     scaler = StandardScaler()

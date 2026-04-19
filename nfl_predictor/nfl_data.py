@@ -497,6 +497,20 @@ def load_closing_lines(
 
     if cache:
         cached = _load_from_s3(cache_key)
+        
+        # If exact cache miss, try broader cached files that might contain our seasons.
+        # e.g. closing_lines_2020_2024_v2.parquet covers a request for 2020-2023.
+        if cached is None:
+            for end_year in range(CURRENT_SEASON + 1, max(_api_key_seasons), -1):
+                broader_key = f"data/odds/closing_lines_{min(_api_key_seasons)}_{end_year}_v2.parquet"
+                if broader_key != cache_key:
+                    broader = _load_from_s3(broader_key)
+                    if broader is not None and "season" in broader.columns:
+                        cached = broader[broader["season"].isin(_api_key_seasons)].copy()
+                        logger.info(f"[DATA] Closing lines S3 cache HIT (broader key {broader_key}): "
+                                   f"filtered to {len(cached)} games for seasons {_api_key_seasons}")
+                        break
+        
         if cached is not None:
             logger.info(f"[DATA] Closing lines S3 cache HIT: {len(cached)} games in {time.time()-t0:.1f}s")
             if "season" in cached.columns:
