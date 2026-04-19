@@ -111,19 +111,9 @@ FEATURE_COLUMNS = [
     "pic_alignment_score",          # continuous: team_alignment x (1 - is_backup)
     "pic_avg_player_epa",           # avg career EPA percentile of players on field (quality signal)
     "pic_players_tracked",          # number of players with valid PIC cycles this game
-    # Legacy stubs — kept for compatibility until retrain clears them
-    "pic_composite_l1",
-    "pic_composite_l2",
-    "pic_lineup_delta_l1",
-    "pic_lineup_delta_l2",
-    "pic_key_player_active",
-    "pic_ol_composite",
-    "pic_pass_rush_opp",
 
     # ── Layer 4: PIM stubs (Phase 4 — not yet implemented) ──────────────
-    "pim_trajectory",               # PIM-adjusted trajectory composite
-    "pim_salary_signal",            # salary arbitrage revealed-preference signal
-    "pim_volatility",               # roster reliability (lower = better)
+    # pim_trajectory, pim_salary_signal, pim_volatility — removed until implemented
 
     # ── Contextual / Standard Features ──────────────────────────────────
     "is_home",                      # 1 if this is the home team row
@@ -247,9 +237,9 @@ def engineer_features(
     # split noise from excessive NaN propagation.
     pic_continuous_cols = [
         "pic_qb_in_zone", "pic_qb_career_rate",
-        "pic_ol_sync_rate", "pic_ol_quality_weighted", "pic_ol_composite",
+        "pic_ol_sync_rate", "pic_ol_quality_weighted",
         "pic_skill_sync_rate", "pic_team_alignment", "pic_present_quality",
-        "pic_avg_player_epa", "pic_alignment_score", "pic_composite_l1",
+        "pic_avg_player_epa", "pic_alignment_score",
     ]
     pic_cols_present = [c for c in pic_continuous_cols if c in df.columns]
     if pic_cols_present and "team" in df.columns and "season" in df.columns:
@@ -939,9 +929,6 @@ def _build_qb_features(df: pd.DataFrame, qb_df: pd.DataFrame = None) -> pd.DataF
     """Merge pre-game QB efficiency features into game-team rows."""
     if qb_df is None or qb_df.empty:
         logger.warning("[FEAT] QB data not provided — QB features will be NaN")
-        for col in ["pic_composite_l1", "pic_key_player_active", "pic_ol_composite", "pic_pass_rush_opp"]:
-            if col not in df.columns:
-                df[col] = np.nan
         return df
 
     qb_cols = [c for c in ["game_id", "team", "qb_epa_5g", "qb_epa_season",
@@ -952,16 +939,7 @@ def _build_qb_features(df: pd.DataFrame, qb_df: pd.DataFrame = None) -> pd.DataF
     df = df.merge(qb, on=["game_id", "team"], how="left")
     df = df.reset_index(drop=True)
 
-    if "qb_epa_5g" in df.columns:
-        df["pic_composite_l1"] = df["qb_epa_5g"]
-    if "is_backup_qb" in df.columns:
-        df["pic_key_player_active"] = 1 - df["is_backup_qb"].fillna(0)
-    if "qb_completion_pct" in df.columns:
-        df["pic_ol_composite"] = df["qb_completion_pct"]
-    if "qb_air_yards" in df.columns:
-        df["pic_pass_rush_opp"] = df["qb_air_yards"]
-
-    n_valid = df["pic_composite_l1"].notna().sum() if "pic_composite_l1" in df.columns else 0
+    n_valid = df["qb_epa_5g"].notna().sum() if "qb_epa_5g" in df.columns else 0
     logger.info(f"[FEAT]   QB features merged: {n_valid}/{len(df)} valid")
 
     return df

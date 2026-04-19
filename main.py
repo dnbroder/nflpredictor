@@ -397,13 +397,21 @@ def backtest(
         all_drives = load_drives(all_seasons)
         pbp = load_plays(all_seasons, cache=True)
         players = load_players(cache=True)
+        closing_lines = load_closing_lines(all_seasons, cache=True)
+        epa = load_epa_by_game(all_seasons, cache=True)
+        qb = load_qb_stats(all_seasons, cache=True)
         logger.info(f"[BACKTEST] Data: {len(all_games)} games, {len(all_drives)} drives, "
-                    f"{len(pbp)} plays, {len(players)} players")
+                    f"{len(pbp)} plays, {len(players)} players, "
+                    f"{len(closing_lines) if closing_lines is not None and not closing_lines.empty else 0} closing lines, "
+                    f"{len(epa) if epa is not None and not epa.empty else 0} EPA records, "
+                    f"{len(qb) if qb is not None and not qb.empty else 0} QB records")
 
-        logger.info(f"[BACKTEST] Step 2/4: Engineering features (L1+L2+L3)...")
+        logger.info(f"[BACKTEST] Step 2/4: Engineering features (L1+L2+L3 + EPA + QB + closing lines)...")
         full_featured = engineer_features(
             all_games, all_drives,
             pbp_df=pbp, players_df=players,
+            closing_lines_df=closing_lines,
+            epa_df=epa, qb_df=qb,
         )
         logger.info(f"[BACKTEST] Features: {len(full_featured)} rows")
 
@@ -457,10 +465,28 @@ def backtest_async(
             players = load_players(cache=True)
             logger.info(f"[ASYNC-BACKTEST {job_id}] {len(players)} players")
 
-            logger.info(f"[ASYNC-BACKTEST {job_id}] Engineering features (L1+L2+L3)...")
+            logger.info(f"[ASYNC-BACKTEST {job_id}] Loading closing lines...")
+            closing_lines = load_closing_lines(all_seasons, cache=True)
+            n_cl = len(closing_lines) if closing_lines is not None and not closing_lines.empty else 0
+            logger.info(f"[ASYNC-BACKTEST {job_id}] {n_cl} closing line records")
+
+            logger.info(f"[ASYNC-BACKTEST {job_id}] Loading EPA by game...")
+            epa = load_epa_by_game(all_seasons, cache=True)
+            n_epa = len(epa) if epa is not None and not epa.empty else 0
+            logger.info(f"[ASYNC-BACKTEST {job_id}] {n_epa} EPA records")
+
+            logger.info(f"[ASYNC-BACKTEST {job_id}] Loading QB stats...")
+            qb = load_qb_stats(all_seasons, cache=True)
+            n_qb = len(qb) if qb is not None and not qb.empty else 0
+            logger.info(f"[ASYNC-BACKTEST {job_id}] {n_qb} QB records")
+            _log_memory(f"backtest_{job_id}_after_all_data")
+
+            logger.info(f"[ASYNC-BACKTEST {job_id}] Engineering features (L1+L2+L3 + EPA + QB + closing lines)...")
             full_featured = engineer_features(
                 all_games, all_drives,
                 pbp_df=pbp, players_df=players,
+                closing_lines_df=closing_lines,
+                epa_df=epa, qb_df=qb,
             )
             logger.info(f"[ASYNC-BACKTEST {job_id}] {len(full_featured)} feature rows")
             _log_memory(f"backtest_{job_id}_after_features")
