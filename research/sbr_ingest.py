@@ -71,10 +71,16 @@ def sbr_to_nfl(sbr_name: str, season: int) -> str:
         return 'SD' if season <= 2016 else 'LAC'
 
     # St. Louis → LA Rams (moved 2016)
+    # nflfastR uses STL through 2015, LA in 2016, LAR from 2017
     if sbr_name in ('St.Louis', 'StLouis'):
         return 'STL'  # STL only appears in 2013-2015 SBR data
     if sbr_name in ('LosAngeles', 'LARams'):
-        return 'STL' if season <= 2015 else 'LAR'
+        if season <= 2015:
+            return 'STL'
+        elif season == 2016:
+            return 'LA'
+        else:
+            return 'LAR'
 
     # Catch-all: 'NewYork' is ambiguous but SBR sometimes uses it for Jets
     if sbr_name == 'NewYork':

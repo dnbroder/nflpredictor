@@ -511,6 +511,11 @@ def load_closing_lines(
                     # Only add games not already in the cached Odds API data
                     sbr_new = sbr_df[~sbr_df["game_id"].isin(cached_game_ids)]
                     if len(sbr_new) > 0:
+                        # Ensure SBR data has same columns as cached to avoid FutureWarning
+                        for col in cached.columns:
+                            if col not in sbr_new.columns:
+                                sbr_new[col] = np.nan
+                        sbr_new = sbr_new[cached.columns]
                         cached = pd.concat([cached, sbr_new], ignore_index=True)
                         logger.info(f"[DATA] SBR supplement: added {len(sbr_new)} games for seasons {sbr_seasons_needed}")
             return cached
@@ -800,6 +805,10 @@ def load_closing_lines(
             if len(sbr_df) > 0:
                 sbr_new = sbr_df[~sbr_df["game_id"].isin(fetched_game_ids)]
                 if len(sbr_new) > 0:
+                    for col in df.columns:
+                        if col not in sbr_new.columns:
+                            sbr_new[col] = np.nan
+                    sbr_new = sbr_new[df.columns]
                     df = pd.concat([df, sbr_new], ignore_index=True)
                     logger.info(f"[DATA] SBR supplement: added {len(sbr_new)} games for seasons {sbr_seasons_needed}")
 
@@ -868,12 +877,18 @@ def load_sbr_closing_lines(seasons, s3_client=None, bucket=None):
             static = {"JAC": "JAX", "HST": "HOU", "CLV": "CLE", "ARZ": "ARI", "SL": "STL"}
             abbr = static.get(abbr, abbr)
             # Era-aware relocated teams
+            # nflfastR abbreviation history:
+            #   Oakland: OAK through 2019, LV from 2020
+            #   San Diego/LA Chargers: SD through 2016, LAC from 2017
+            #   St. Louis/LA Rams: STL through 2015, LA in 2016, LAR from 2017
             if abbr == "LV" and season <= 2019:
                 return "OAK"
             if abbr == "LAC" and season <= 2016:
                 return "SD"
             if abbr == "LAR" and season <= 2015:
                 return "STL"
+            if abbr == "LAR" and season == 2016:
+                return "LA"
             return abbr
 
         rows = []
