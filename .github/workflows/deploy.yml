@@ -135,14 +135,10 @@ jobs:
       - name: Package and deploy Lambdas
         run: |
           echo "=== Packaging predict-weekly Lambda ==="
-          cd lambda
-          zip /tmp/predict-weekly-lambda.zip predict_weekly.py
-          cd ..
+          zip -j /tmp/predict-weekly-lambda.zip lambda/predict_weekly.py
 
           echo "=== Packaging operations Lambda ==="
-          cd lambda
-          zip /tmp/operations-lambda.zip operations.py
-          cd ..
+          zip -j /tmp/operations-lambda.zip lambda/operations.py
 
           echo "=== Deploying predict-weekly Lambda ==="
           aws lambda update-function-code \
