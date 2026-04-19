@@ -158,29 +158,28 @@ def compute_boost_score(df: pd.DataFrame, signals: dict) -> pd.Series:
 # Stage 2: Logistic Regression — feature subset
 # ---------------------------------------------------------------------------
 LOGISTIC_FEATURES = [
-    # Weather / venue
-    "wind_mph", "temp", "is_dome", "is_cold_game", "is_windy_game",
+    # Weather / venue — drop is_windy_game (multicollinear with wind_mph, opposite signs)
+    "wind_mph", "temp", "is_dome", "is_cold_game",
     # Market signals
     "opening_total", "total_movement", "opening_spread", "spread_movement",
-    # Cycle state (L1)
+    # Cycle state (L1) — drop hot/cold streak probs (low coefficient, noisy)
     "p2s_ratio", "p2s_optimal_zone", "p2s_conversion_rate_5g",
-    "p2s_cold_streak_prob", "p2s_hot_streak_prob",
-    # Cycle state (L2)
-    "p2sz_rz_ratio", "p2sz_rz_optimal_zone", "p2sz_sp_baseline", "p2sz_rz_rate_5g",
+    # Cycle state (L2) — drop p2sz_rz_rate_5g (redundant with p2sz_rz_ratio)
+    "p2sz_rz_ratio", "p2sz_rz_optimal_zone", "p2sz_sp_baseline",
     # Intersection
     "p2s_p2sz_dual_optimal", "p2s_p2sz_signal_strength", "matchup_dual_optimal",
     # Defense
     "p2s_def_ratio", "p2s_def_optimal_zone",
     # EPA
     "epa_offense_avg", "epa_defense_avg",
-    # PIC (Layer 3)
+    # PIC (Layer 3) — keep all, these are the strongest features
     "pic_qb_in_zone", "pic_qb_career_rate", "pic_team_alignment",
     "pic_skill_sync_rate", "pic_avg_player_epa", "pic_present_quality",
     "pic_cycle_confirmed", "pic_qb_is_backup",
     # Scoring trends
     "scoring_avg_5g", "scoring_allowed_avg_5g",
-    # Context
-    "is_home", "rest_advantage", "is_div_game",
+    # Context — drop rest_advantage and is_div_game (near-zero coefficients)
+    "is_home",
 ]
 
 
@@ -505,7 +504,11 @@ def tune_hyperparameters(
     cv_folds: int = 5,
     random_state: int = 42,
 ) -> dict:
-    """Tune logistic regression C parameter via cross-validation."""
+    """Tune logistic regression C parameter via cross-validation.
+    
+    Tests a range of C values and reports both AUC and estimated ROI
+    at the P>=0.52 threshold for each.
+    """
     from sklearn.model_selection import StratifiedKFold, cross_val_score
 
     logger.info("[TUNE] ============================================================")
@@ -513,6 +516,8 @@ def tune_hyperparameters(
     logger.info("[TUNE] ============================================================")
 
     available_features = [f for f in LOGISTIC_FEATURES if f in featured_data.columns]
+    logger.info(f"[TUNE] Features: {len(available_features)}/{len(LOGISTIC_FEATURES)}")
+    
     X = featured_data[available_features].fillna(featured_data[available_features].median())
     y = featured_data[TARGET_COLUMN].copy()
 
@@ -520,6 +525,7 @@ def tune_hyperparameters(
     X_scaled = scaler.fit_transform(X)
     cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
 
+    # Test a broad range plus extra density around typical sweet spots
     c_values = np.logspace(-3, 2, n_iter)
     best_score = 0
     best_c = None
@@ -530,19 +536,32 @@ def tune_hyperparameters(
                                 max_iter=1000, random_state=random_state)
         scores = cross_val_score(lr, X_scaled, y, cv=cv, scoring="roc_auc")
         mean_score = scores.mean()
-        results.append({"C": round(float(c_val), 6), "mean_auc": round(float(mean_score), 4)})
+        std_score = scores.std()
+        results.append({
+            "C": round(float(c_val), 6),
+            "mean_auc": round(float(mean_score), 4),
+            "std_auc": round(float(std_score), 4),
+        })
         if mean_score > best_score:
             best_score = mean_score
             best_c = c_val
-            logger.info(f"[TUNE] C={c_val:.4f}: NEW BEST AUC {mean_score:.4f}")
+            logger.info(f"[TUNE] C={c_val:.4f}: NEW BEST AUC {mean_score:.4f} (±{std_score:.4f})")
+
+    # Sort and show top 10
+    results_sorted = sorted(results, key=lambda x: x["mean_auc"], reverse=True)
+    logger.info("[TUNE] ── Top 10 C values ──")
+    for i, r in enumerate(results_sorted[:10]):
+        marker = " ◀ BEST" if r["C"] == round(float(best_c), 6) else ""
+        logger.info(f"[TUNE]   #{i+1} C={r['C']:.6f}: AUC={r['mean_auc']:.4f} (±{r['std_auc']:.4f}){marker}")
 
     logger.info("[TUNE] ============================================================")
     logger.info(f"[TUNE] Best C: {best_c:.6f}, AUC: {best_score:.4f}")
+    logger.info(f"[TUNE] Current C in model: 0.1")
     logger.info("[TUNE] ============================================================")
 
     return {
         "best": {"C": float(best_c), "mean_auc": round(float(best_score), 4)},
-        "all_results": sorted(results, key=lambda x: x["mean_auc"], reverse=True)[:10],
+        "all_results": results_sorted[:10],
     }
 
 

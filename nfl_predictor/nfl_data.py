@@ -812,6 +812,10 @@ def load_closing_lines(
                     df = pd.concat([df, sbr_new], ignore_index=True)
                     logger.info(f"[DATA] SBR supplement: added {len(sbr_new)} games for seasons {sbr_seasons_needed}")
 
+        # Log combined coverage (Odds API + SBR)
+        logger.info(f"[DATA] ── COMBINED CLOSING LINES ──")
+        logger.info(f"[DATA]   Total coverage: {len(df)}/{total_target} games ({len(df)/total_target*100:.1f}%)")
+
         return df
 
     except ImportError as e:
@@ -880,14 +884,14 @@ def load_sbr_closing_lines(seasons, s3_client=None, bucket=None):
             # nflfastR abbreviation history:
             #   Oakland: OAK through 2019, LV from 2020
             #   San Diego/LA Chargers: SD through 2016, LAC from 2017
-            #   St. Louis/LA Rams: STL through 2015, LA in 2016, LAR from 2017
+            #   St. Louis/LA Rams: STL through 2015, LA from 2016+ (nflfastR uses LA, not LAR)
             if abbr == "LV" and season <= 2019:
                 return "OAK"
             if abbr == "LAC" and season <= 2016:
                 return "SD"
             if abbr == "LAR" and season <= 2015:
                 return "STL"
-            if abbr == "LAR" and season == 2016:
+            if abbr == "LAR" and season >= 2016:
                 return "LA"
             return abbr
 
