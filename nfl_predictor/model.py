@@ -307,7 +307,7 @@ def train_model(
     X_test_scaled = scaler.transform(X_test_imputed)
 
     lr_model = LogisticRegression(
-        C=0.1, penalty="l2", solver="lbfgs", max_iter=1000, random_state=random_state,
+        C=0.034, penalty="l2", solver="lbfgs", max_iter=1000, random_state=random_state,
     )
     lr_model.fit(X_train_scaled, y_train)
 
@@ -575,7 +575,7 @@ def tune_hyperparameters(
 
     logger.info("[TUNE] ============================================================")
     logger.info(f"[TUNE] Best C: {best_c:.6f}, AUC: {best_score:.4f}")
-    logger.info(f"[TUNE] Current C in model: 0.1")
+    logger.info(f"[TUNE] Current C in model: 0.034")
     logger.info("[TUNE] ============================================================")
 
     return {
