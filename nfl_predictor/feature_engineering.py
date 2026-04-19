@@ -437,30 +437,60 @@ def _reshape_to_game_team(
 def _build_target(df: pd.DataFrame) -> pd.DataFrame:
     """
     Build binary target: did the game go over the total line?
-    Uses closing_total if available (preferred — sharpest number).
-    Falls back to total_line (opening line) if closing_total is absent.
+    Uses closing_total where available (preferred — sharpest number),
+    falls back to opening_total per-row for games without closing data.
+    Tags each row with 'target_line_source' for downstream debugging.
     """
-    # Determine which total to use
+    # Build best-available total: closing where we have it, opening otherwise
     if "closing_total" in df.columns and df["closing_total"].notna().sum() > 0:
-        total_col = "closing_total"
-        logger.info(f"[FEAT] Using closing_total for target ({df['closing_total'].notna().sum()} valid)")
+        n_closing = df["closing_total"].notna().sum()
+        best_total = df["closing_total"].copy()
+        # Track source per row: 'closing' or 'opening_fallback'
+        df["target_line_source"] = np.where(df["closing_total"].notna(), "closing", "missing")
+        if "opening_total" in df.columns:
+            n_fallback = best_total.isna().sum()
+            best_total = best_total.fillna(df["opening_total"])
+            n_filled = n_fallback - best_total.isna().sum()
+            df.loc[(df["target_line_source"] == "missing") & df["opening_total"].notna(),
+                   "target_line_source"] = "opening_fallback"
+            logger.info(
+                f"[FEAT] Target line: {n_closing} closing + {n_filled} opening fallback "
+                f"= {best_total.notna().sum()} total"
+            )
+        else:
+            logger.info(f"[FEAT] Using closing_total for target ({n_closing} valid)")
+
+        # Per-season breakdown so you can see exactly where gaps are
+        if "season" in df.columns:
+            for season, grp in df.groupby("season"):
+                n_c = (grp["target_line_source"] == "closing").sum()
+                n_o = (grp["target_line_source"] == "opening_fallback").sum()
+                n_m = (grp["target_line_source"] == "missing").sum()
+                tag = "" if n_o == 0 and n_m == 0 else " ← NEEDS CLOSING DATA"
+                logger.info(
+                    f"[FEAT]   Season {season}: {n_c} closing, {n_o} opening fallback, "
+                    f"{n_m} missing{tag}"
+                )
     elif "opening_total" in df.columns and df["opening_total"].notna().sum() > 0:
-        total_col = "opening_total"
+        best_total = df["opening_total"].copy()
+        df["target_line_source"] = "opening_fallback"
         logger.warning("[FEAT] closing_total unavailable — falling back to opening_total")
     elif "total_line" in df.columns and df["total_line"].notna().sum() > 0:
-        total_col = "total_line"
+        best_total = df["total_line"].copy()
+        df["target_line_source"] = "opening_fallback"
         logger.warning("[FEAT] closing_total unavailable — falling back to total_line (opening line)")
     else:
         logger.error("[FEAT] No total line column found — target will be all NaN")
         df[TARGET_COLUMN] = np.nan
+        df["target_line_source"] = "missing"
         return df
 
-    n_missing = df[total_col].isna().sum()
+    n_missing = best_total.isna().sum()
     if n_missing > 0:
-        logger.warning(f"[FEAT] {total_col} is NaN for {n_missing}/{len(df)} rows — those rows will be dropped")
+        logger.warning(f"[FEAT] Best-available total is NaN for {n_missing}/{len(df)} rows — those rows will be dropped")
 
-    df[TARGET_COLUMN] = (df["total_points"] > df[total_col]).astype(float)
-    df.loc[df[total_col].isna() | df["total_points"].isna(), TARGET_COLUMN] = np.nan
+    df[TARGET_COLUMN] = (df["total_points"] > best_total).astype(float)
+    df.loc[best_total.isna() | df["total_points"].isna(), TARGET_COLUMN] = np.nan
 
     pos_rate = df[TARGET_COLUMN].mean()
     n_valid = df[TARGET_COLUMN].notna().sum()

@@ -792,6 +792,17 @@ def load_closing_lines(
         if cache and len(df) > 0:
             _save_to_s3(df, cache_key)
 
+        # Supplement with SBR data for pre-2020 seasons (cache miss path)
+        sbr_seasons_needed = [s for s in seasons if s <= 2019]
+        if sbr_seasons_needed:
+            fetched_game_ids = set(df["game_id"].tolist())
+            sbr_df = load_sbr_closing_lines(sbr_seasons_needed)
+            if len(sbr_df) > 0:
+                sbr_new = sbr_df[~sbr_df["game_id"].isin(fetched_game_ids)]
+                if len(sbr_new) > 0:
+                    df = pd.concat([df, sbr_new], ignore_index=True)
+                    logger.info(f"[DATA] SBR supplement: added {len(sbr_new)} games for seasons {sbr_seasons_needed}")
+
         return df
 
     except ImportError as e:
@@ -848,15 +859,16 @@ def load_sbr_closing_lines(seasons, s3_client=None, bucket=None):
             if key_flip not in sched_lookup:
                 sched_lookup[key_flip] = (row["game_id"], row.get("week"))
 
-        # SBR team abbreviation fixes for edge cases not in main map
+        # SBR team abbreviation fixes for edge cases not in main map.
+        # NOTE: Do NOT remap OAK→LV or SD→LAC here — for 2016-2019,
+        # the nflfastR schedule uses the original abbreviations (OAK, SD).
+        # The schedule lookup already has the correct historical keys.
         SBR_FIXUPS = {
             "JAC": "JAX",   # SBR sometimes uses JAC
             "HST": "HOU",   # SBR Houston
             "CLV": "CLE",   # SBR Cleveland
             "ARZ": "ARI",   # SBR Arizona
-            "SL":  "LAR",   # old St. Louis abbreviation
-            "SD":  "LAC",   # old San Diego abbreviation
-            "OAK": "LV",    # Oakland Raiders
+            "SL":  "STL",   # SBR St. Louis → nflfastR STL (pre-2016)
         }
 
         rows = []
@@ -890,7 +902,10 @@ def load_sbr_closing_lines(seasons, s3_client=None, bucket=None):
             f"for seasons {sbr_seasons}"
         )
         if missed:
-            logger.debug(f"[DATA] SBR unmatched games ({len(missed)}): {missed[:10]}")
+            logger.warning(f"[DATA] SBR unmatched games ({len(missed)}): {missed[:10]}")
+            # Log SBR team names to help diagnose abbreviation mismatches
+            sbr_teams = sorted(set(t for _, a, h in missed for t in [a, h]))
+            logger.warning(f"[DATA] SBR unmatched team abbrevs: {sbr_teams}")
         return result
 
     except Exception as e:
