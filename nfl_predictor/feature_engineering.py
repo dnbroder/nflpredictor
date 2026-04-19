@@ -467,7 +467,19 @@ def _build_target(df: pd.DataFrame) -> pd.DataFrame:
                 n_c = (grp["target_line_source"] == "closing").sum()
                 n_o = (grp["target_line_source"] == "opening_fallback").sum()
                 n_m = (grp["target_line_source"] == "missing").sum()
-                tag = "" if n_o == 0 and n_m == 0 else " ← NEEDS CLOSING DATA"
+                total = len(grp)
+                # A fully-covered season has ~530-570 rows with closing data.
+                # Week 1 (~30-34 rows) will always fall back to opening because
+                # there's no prior-week closing line to compute movement from.
+                # Flag only seasons where the gap is larger than week 1.
+                if n_m > 0:
+                    tag = " ← MISSING DATA"
+                elif n_o > 40:
+                    tag = " ← NEEDS CLOSING DATA"
+                elif n_o > 0:
+                    tag = " (week 1 fallback only — expected)"
+                else:
+                    tag = ""
                 logger.info(
                     f"[FEAT]   Season {season}: {n_c} closing, {n_o} opening fallback, "
                     f"{n_m} missing{tag}"

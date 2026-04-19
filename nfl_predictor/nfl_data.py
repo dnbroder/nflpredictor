@@ -912,7 +912,7 @@ def load_sbr_closing_lines(seasons, s3_client=None, bucket=None):
                     "home_team":      home,
                     "away_team":      away,
                     "closing_total":  float(sbr_row["closing_total"]),
-                    "closing_spread": None,
+                    "closing_spread": float(sbr_row["closing_spread"]) if pd.notna(sbr_row.get("closing_spread")) else None,
                 })
             else:
                 missed.append((int(sbr_row["season"]), away, home))
