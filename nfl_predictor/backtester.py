@@ -73,8 +73,7 @@ def run_backtest(featured_data, target="over_total", train_seasons=4, test_seaso
 
         # Support both two-stage (dict with logistic_model) and legacy XGBoost
         if isinstance(model_result, dict) and "logistic_model" in model_result:
-            # Two-stage model: use logistic regression for probabilities
-            lr = model_result["logistic_model"]
+            # Two-stage model: use calibrated probabilities when available
             lr_features = model_result["logistic_features"]
             lr_scaler = model_result["scaler"]
             medians = model_result.get("train_medians", {})
@@ -83,7 +82,11 @@ def run_backtest(featured_data, target="over_total", train_seasons=4, test_seaso
                 if col in medians:
                     X_lr[col] = X_lr[col].fillna(medians[col])
             X_lr_scaled = lr_scaler.transform(X_lr)
-            y_proba = lr.predict_proba(X_lr_scaled)[:, 1]
+            # Prefer calibrated model (Platt scaling) over raw logistic
+            if "calibrated_model" in model_result:
+                y_proba = model_result["calibrated_model"].predict_proba(X_lr_scaled)[:, 1]
+            else:
+                y_proba = model_result["logistic_model"].predict_proba(X_lr_scaled)[:, 1]
         else:
             # Legacy XGBoost
             y_proba = model_result.predict_proba(X_test)[:, 1]

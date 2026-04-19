@@ -314,6 +314,17 @@ def train_model(
     train_elapsed = _time.time() - train_start
     logger.info(f"[MODEL] Logistic regression trained in {train_elapsed:.2f}s")
 
+    # ── Platt scaling calibration ──
+    # Use 3-fold CV on training data to produce calibrated probabilities.
+    # This fixes the overconfidence problem where the model says 57% but
+    # only wins 50%. After calibration, probabilities are honest.
+    from sklearn.calibration import CalibratedClassifierCV
+    calibrated_model = CalibratedClassifierCV(
+        lr_model, cv=3, method="sigmoid",
+    )
+    calibrated_model.fit(X_train_scaled, y_train)
+    logger.info("[MODEL] Platt scaling calibration fitted (sigmoid, 3-fold CV)")
+
     # Coefficients
     coef_dict = dict(zip(available_features, lr_model.coef_[0]))
     sorted_coefs = sorted(coef_dict.items(), key=lambda x: abs(x[1]), reverse=True)
@@ -322,19 +333,21 @@ def train_model(
         logger.info(f"[MODEL]   # {rank} {feat}: {coef:+.4f}")
 
     # ── Evaluate ──
-    y_proba = lr_model.predict_proba(X_test_scaled)[:, 1]
+    y_proba_raw = lr_model.predict_proba(X_test_scaled)[:, 1]
+    y_proba = calibrated_model.predict_proba(X_test_scaled)[:, 1]
     y_pred = (y_proba >= 0.5).astype(int)
 
     accuracy = accuracy_score(y_test, y_pred)
     auc = roc_auc_score(y_test, y_proba)
     logloss = log_loss(y_test, y_proba)
     brier = float(np.mean((y_proba - y_test.values) ** 2))
+    brier_raw = float(np.mean((y_proba_raw - y_test.values) ** 2))
 
     logger.info("[MODEL] ---- Test Set Results (all games) ----")
     logger.info(f"[MODEL]   Accuracy:    {accuracy:.4f}  (break-even: 0.5238)")
     logger.info(f"[MODEL]   AUC-ROC:     {auc:.4f}")
     logger.info(f"[MODEL]   Log Loss:    {logloss:.4f}")
-    logger.info(f"[MODEL]   Brier Score: {brier:.4f}")
+    logger.info(f"[MODEL]   Brier Score: {brier:.4f} (raw: {brier_raw:.4f}, improvement: {brier_raw - brier:+.4f})")
 
     report = classification_report(y_test, y_pred, zero_division=0)
     for line in report.split("\n"):
@@ -343,13 +356,19 @@ def train_model(
 
     # Probability spread
     logger.info("[MODEL] Probability spread diagnostic (test set):")
-    logger.info(f"[MODEL]   Logistic — mean={y_proba.mean():.3f}, "
+    logger.info(f"[MODEL]   Raw      — mean={y_proba_raw.mean():.3f}, "
+               f"std={y_proba_raw.std():.3f}, min={y_proba_raw.min():.3f}, max={y_proba_raw.max():.3f}, "
+               f"above_0.5={(y_proba_raw >= 0.5).sum()}/{len(y_proba_raw)}")
+    logger.info(f"[MODEL]   Calibrated — mean={y_proba.mean():.3f}, "
                f"std={y_proba.std():.3f}, min={y_proba.min():.3f}, max={y_proba.max():.3f}, "
                f"above_0.5={(y_proba >= 0.5).sum()}/{len(y_proba)}")
     percentiles = [10, 25, 50, 75, 90]
-    pct_vals = np.percentile(y_proba, percentiles)
-    pct_str = ", ".join(f"p{p}={v:.3f}" for p, v in zip(percentiles, pct_vals))
-    logger.info(f"[MODEL]   Percentiles: {pct_str}")
+    pct_raw = np.percentile(y_proba_raw, percentiles)
+    pct_cal = np.percentile(y_proba, percentiles)
+    pct_str_raw = ", ".join(f"p{p}={v:.3f}" for p, v in zip(percentiles, pct_raw))
+    pct_str_cal = ", ".join(f"p{p}={v:.3f}" for p, v in zip(percentiles, pct_cal))
+    logger.info(f"[MODEL]   Raw pcts:  {pct_str_raw}")
+    logger.info(f"[MODEL]   Cal pcts:  {pct_str_cal}")
 
     # ── Two-stage combined evaluation ──
     logger.info("[MODEL] -- Two-Stage Combined Results --")
@@ -414,6 +433,7 @@ def train_model(
         "type": "two_stage_v1",
         "scaler": scaler,
         "logistic_model": lr_model,
+        "calibrated_model": calibrated_model,
         "logistic_features": available_features,
         "all_features": all_features,
         "train_medians": train_medians.to_dict(),
@@ -463,7 +483,6 @@ def predict(model_package: dict, game_features: pd.DataFrame) -> pd.DataFrame:
     model's calibrated probabilities. Filter signals are still computed
     and returned as informational columns for monitoring.
     """
-    lr_model = model_package["logistic_model"]
     scaler = model_package["scaler"]
     features = model_package["logistic_features"]
     medians = model_package.get("train_medians", {})
@@ -473,7 +492,12 @@ def predict(model_package: dict, game_features: pd.DataFrame) -> pd.DataFrame:
         if col in medians:
             X[col] = X[col].fillna(medians[col])
     X_scaled = scaler.transform(X)
-    proba = lr_model.predict_proba(X_scaled)[:, 1]
+    
+    # Use calibrated model if available, otherwise raw logistic
+    if "calibrated_model" in model_package:
+        proba = model_package["calibrated_model"].predict_proba(X_scaled)[:, 1]
+    else:
+        proba = model_package["logistic_model"].predict_proba(X_scaled)[:, 1]
 
     # Filter signals kept as informational columns only
     over_mask = apply_filter(game_features, model_package.get("over_filter_rules", OVER_FILTER_RULES))
