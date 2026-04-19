@@ -128,11 +128,12 @@ FEATURE_COLUMNS = [
     "season_week",                  # week number (1-18)
     "is_playoffs",                  # 1 if playoff game
     "opening_total",                # opening total line
-    "closing_total",                # closing total line
-    "total_movement",               # closing - opening (sharp signal)
+    # closing_total: REMOVED — it defines the target (over_total). Using it as a
+    # feature creates a circular dependency that collapses probability spread.
+    "total_movement",               # closing - opening (sharp money signal — this IS useful)
     "opening_spread",               # opening spread (home perspective)
-    "closing_spread",               # closing spread
-    "spread_movement",              # closing - opening spread
+    # closing_spread: REMOVED — same target-leakage risk as closing_total.
+    "spread_movement",              # closing - opening spread (sharp money signal)
     "implied_team_score",           # from spread + total
     "vegas_win_prob",               # market-implied win probability
     "epa_offense_avg",              # rolling EPA/play offense

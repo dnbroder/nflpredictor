@@ -32,14 +32,14 @@ S3_MODEL_KEY = f"models/{MODEL_FILENAME}"
 
 # Default hyperparameters — tuned for NFL totals (~1600 rows, noisy signal)
 DEFAULT_PARAMS = {
-    "n_estimators": 500,
-    "max_depth": 4,          # shallower — prevents overfitting on noisy signal
-    "learning_rate": 0.02,   # slower learning — more trees at lower lr
+    "n_estimators": 1500,
+    "max_depth": 3,          # shallower — closing line target has less learnable signal
+    "learning_rate": 0.008,  # very slow — let the model build many small trees
     "subsample": 0.8,
     "colsample_bytree": 0.7,
-    "min_child_weight": 3,   # was 5/7 — too aggressive, caused best_iteration=3/4
-    "reg_alpha": 0.05,
-    "reg_lambda": 1.0,
+    "min_child_weight": 5,   # conservative splits — prevent overfitting on noise
+    "reg_alpha": 0.1,        # L1 regularization — encourage feature sparsity
+    "reg_lambda": 2.0,       # L2 regularization — shrink leaf weights
     "scale_pos_weight": 1.0,
 }
 
@@ -159,7 +159,7 @@ def train_model(
         scale_pos_weight=hp.get("scale_pos_weight", 1.0),
         random_state=random_state,
         eval_metric="auc",        # AUC more meaningful than logloss for this signal
-        early_stopping_rounds=50, # give model room before stopping
+        early_stopping_rounds=100, # generous patience at lr=0.008 — let it find subtle signal
         n_jobs=-1,
     )
 
