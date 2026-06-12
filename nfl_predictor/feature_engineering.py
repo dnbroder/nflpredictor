@@ -502,15 +502,26 @@ def _build_target(df: pd.DataFrame) -> pd.DataFrame:
     if n_missing > 0:
         logger.warning(f"[FEAT] Best-available total is NaN for {n_missing}/{len(df)} rows — those rows will be dropped")
 
-    df[TARGET_COLUMN] = (df["total_points"] > best_total).astype(float)
-    df.loc[best_total.isna() | df["total_points"].isna(), TARGET_COLUMN] = np.nan
+    # Carry the exact line the target is scored against, and the signed margin,
+    # so the backtester can score pushes as refunds (no-action) rather than as bets.
+    df["target_total"] = best_total
+    df["total_margin"] = df["total_points"] - best_total          # >0 over, <0 under, 0 push
+    df["is_push"] = (df["total_margin"] == 0)
 
+    # Binary training target EXCLUDES pushes (NaN -> dropped). A push is not a clean
+    # over/under example; the old `> best_total` silently mislabeled it as an under.
+    df[TARGET_COLUMN] = np.where(df["total_margin"] > 0, 1.0,
+                          np.where(df["total_margin"] < 0, 0.0, np.nan))
+    df.loc[best_total.isna() | df["total_points"].isna(), TARGET_COLUMN] = np.nan
+    df.loc[best_total.isna() | df["total_points"].isna(), "is_push"] = False
+
+    n_push = int(df["is_push"].sum())
     pos_rate = df[TARGET_COLUMN].mean()
     n_valid = df[TARGET_COLUMN].notna().sum()
     logger.info(
-        f"[FEAT]   Target '{TARGET_COLUMN}': {n_valid}/{len(df)} valid rows, "
-        f"{pos_rate:.3f} positive rate "
-        f"(expect ~0.49-0.51 vs closing line)"
+        f"[FEAT]   Target '{TARGET_COLUMN}': {n_valid}/{len(df)} decided rows "
+        f"({n_push} pushes excluded), {pos_rate:.3f} over rate "
+        f"(expect ~0.48-0.50 vs closing line)"
     )
     return df
 

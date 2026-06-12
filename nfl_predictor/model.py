@@ -205,11 +205,18 @@ def train_model(
     test_size: float = 0.2,
     random_state: int = 42,
     params: dict = None,
+    holdout: float = None,
 ) -> tuple:
     """
     Train two-stage model: rule filter + logistic regression.
     Returns (model_package, metrics_dict).
+
+    holdout: fraction held out for the in-sample logging metric. If None, falls back
+    to `test_size`. Pass holdout=0.0 (as the walk-forward backtester does) to TRAIN ON
+    ALL provided rows — the real out-of-sample test is the held-out future season, so
+    an internal split there just throws away a fifth of each fold's training data.
     """
+    split_frac = holdout if holdout is not None else test_size
     logger.info("[MODEL] ============================================================")
     logger.info(f"[MODEL] TRAINING Two-Stage Model -- target={TARGET_COLUMN}, rows={len(featured_data)}")
     logger.info("[MODEL] ============================================================")
@@ -253,11 +260,17 @@ def train_model(
     logger.info(f"[MODEL] Target distribution: {y.value_counts().to_dict()}")
     logger.info(f"[MODEL] Target positive rate: {y.mean():.3f}")
 
-    # Train/test split
+    # Train/test split.  split_frac<=0 -> no internal holdout: fit on ALL rows
+    # (the backtester evaluates on a separate future season, so the holdout is waste).
     X_full = featured_data[all_features].copy()
-    X_train_full, X_test_full, y_train, y_test = train_test_split(
-        X_full, y, test_size=test_size, random_state=random_state, stratify=y,
-    )
+    if split_frac and split_frac > 0:
+        X_train_full, X_test_full, y_train, y_test = train_test_split(
+            X_full, y, test_size=split_frac, random_state=random_state, stratify=y,
+        )
+    else:
+        X_train_full = X_test_full = X_full
+        y_train = y_test = y
+        logger.info("[MODEL] holdout=0 -> training on ALL rows (no internal split)")
     X_train = X_train_full[available_features].copy()
     X_test = X_test_full[available_features].copy()
     logger.info(f"[MODEL] Split: train={len(X_train)}, test={len(X_test)}")
