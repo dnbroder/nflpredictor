@@ -65,10 +65,16 @@ SAT_PICK_DOW, SAT_HOUR = 5, 12              # Sat 12:00Z  -> Sunday-slate pick-t
 TNF_PICK_HOUR          = 14                 # Tue 14:00Z  -> TNF pick-time (~10am ET)
 CLOSE_LEAD_MIN         = 10                 # close = snapshot floor(kickoff - 10min)
 
-# Paths (override with CLI)
-SCHEDULE_PATH  = "data/schedules/games_2016_2024.parquet"   # nflverse schedule you have
-CACHE_DIR      = "odds_cache"               # raw snapshot JSON cache (one file / ts)
-OUT_PATH       = "data/odds/lines_timestamped_2020_2025.parquet"
+# Schedule source: defaults to the public nflverse games file (always current, includes
+# the latest completed season). Pass --schedule <path.parquet|.csv> to use a local file.
+SCHED_URL      = "https://raw.githubusercontent.com/nflverse/nfldata/master/data/games.csv"
+SCHEDULE_PATH  = None                        # None -> fetch SCHED_URL
+
+# Paths anchored to THIS file (CWD-independent) so the credit-spent cache never moves.
+_HERE          = os.path.dirname(os.path.abspath(__file__))
+_REPO          = os.path.dirname(_HERE)      # research/ -> repo root
+CACHE_DIR      = os.path.join(_HERE, "odds_cache")   # raw snapshot JSON cache (1 file / ts)
+OUT_PATH       = os.path.join(_REPO, "data", "odds", "lines_timestamped_2020_2025.parquet")
 
 CREDITS_PER_SNAPSHOT = 10 * len(MARKETS) * len(REGIONS.split(","))
 ET = ZoneInfo("America/New_York")
@@ -90,6 +96,12 @@ NAME2ABBR = {
     "Washington Football Team":"WAS","Washington Redskins":"WAS",
 }
 
+# Collapse abbreviation conventions so the schedule<->odds join is convention-agnostic.
+# nfldata uses LA for the Rams; nflfastR uses LAR; likewise for relocated teams.
+ALIAS = {"LAR":"LA", "STL":"LA", "SD":"LAC", "OAK":"LV", "WSH":"WAS", "JAC":"JAX"}
+def norm(ab):
+    return ALIAS.get(ab, ab)
+
 # ===========================================================================
 # Schedule -> kickoff times -> needed snapshot timestamps
 # ===========================================================================
@@ -101,7 +113,13 @@ def iso_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def load_schedule(path: str) -> pd.DataFrame:
-    g = pd.read_parquet(path)
+    if path:
+        g = pd.read_parquet(path) if str(path).endswith(".parquet") else pd.read_csv(path)
+    else:
+        import urllib.request, io
+        print(f"Fetching schedule from {SCHED_URL}")
+        raw = urllib.request.urlopen(SCHED_URL, timeout=60).read()
+        g = pd.read_csv(io.BytesIO(raw))
     g = g[g["season"].isin(SEASONS)].copy()
     # kickoff: gameday (date) + gametime (ET HH:MM) localized ET -> UTC
     def kickoff(row):
@@ -209,7 +227,8 @@ def _index_snapshot(payload: dict) -> dict:
     """Map (home_abbr, away_abbr) -> event dict for one snapshot."""
     idx = {}
     for ev in (payload or {}).get("data", []):
-        h = NAME2ABBR.get(ev.get("home_team")); a = NAME2ABBR.get(ev.get("away_team"))
+        h = norm(NAME2ABBR.get(ev.get("home_team"))) if NAME2ABBR.get(ev.get("home_team")) else None
+        a = norm(NAME2ABBR.get(ev.get("away_team"))) if NAME2ABBR.get(ev.get("away_team")) else None
         if h and a:
             idx[(h, a)] = ev
     return idx
@@ -236,7 +255,7 @@ def build_table(sched: pd.DataFrame, per_game: dict) -> pd.DataFrame:
                "kickoff_utc": iso_z(r["kickoff_utc"]),
                "actual_total": r["total"]}
         for phase in ("open", "pick", "close"):
-            ev = get_snap(ts.get(phase, "")).get((r["home_team"], r["away_team"]))
+            ev = get_snap(ts.get(phase, "")).get((norm(r["home_team"]), norm(r["away_team"])))
             tot, hsp = (_lines_from_event(ev) if ev else ({}, {}))
             a_t, c_t, n = pick(tot, "tot")
             a_s, c_s, _ = pick(hsp, "spr")
